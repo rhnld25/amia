@@ -1,0 +1,216 @@
+"""Static dashboard rendered from the database, published to GitHub Pages."""
+
+from __future__ import annotations
+
+import html
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+from . import evaluation
+from .config import FRAMEWORK_VERSION, PORTFOLIO
+from .db import DB
+from .portfolio import metrics
+
+
+def _pct(v: Any, digits: int = 1) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "–"
+    return f"{v * 100:+.{digits}f}%" if digits >= 0 else f"{v * 100:.0f}%"
+
+
+def _num(v: Any, digits: int = 2) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "–"
+    return f"{v:,.{digits}f}"
+
+
+def _e(s: Any) -> str:
+    return html.escape(str(s if s is not None else ""))
+
+
+CSS = """
+:root{color-scheme:light;--surface-0:#f5f5f3;--surface-1:#fcfcfb;--border:#e4e3df;--grid:#ecebe7;
+--text-primary:#0b0b0b;--text-secondary:#52514e;--text-muted:#7a7974;
+--series-1:#2a78d6;--series-2:#eb6834;--series-3:#1baf7a;--good:#0ca30c;--critical:#d03b3b;--warning:#fab219}
+@media (prefers-color-scheme:dark){:root:where(:not([data-theme="light"])){color-scheme:dark;--surface-0:#121211;--surface-1:#1a1a19;
+--border:#2e2e2c;--grid:#262624;--text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8f8e86;
+--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70}}
+:root[data-theme="dark"]{color-scheme:dark;--surface-0:#121211;--surface-1:#1a1a19;--border:#2e2e2c;--grid:#262624;
+--text-primary:#f0efec;--text-secondary:#c3c2b7;--text-muted:#8f8e86;--series-1:#3987e5;--series-2:#d95926;--series-3:#199e70}
+*{box-sizing:border-box}body{margin:0;background:var(--surface-0);color:var(--text-primary);
+font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 12px}
+.sub{color:var(--text-secondary);margin:0 0 20px;font-size:14px}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.tile{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
+.tile .k{color:var(--text-secondary);font-size:12px}.tile .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
+.tile .n{color:var(--text-muted);font-size:12px}
+.card{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:16px;overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-size:13px;font-variant-numeric:tabular-nums}
+th{text-align:left;color:var(--text-secondary);font-weight:500;border-bottom:1px solid var(--border);padding:6px 8px;white-space:nowrap}
+td{border-bottom:1px solid var(--grid);padding:6px 8px;vertical-align:top}td.r,th.r{text-align:right}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;color:var(--text-secondary);margin-bottom:8px}
+.legend i{display:inline-block;width:14px;height:2px;vertical-align:middle;margin-right:6px}
+.chart{position:relative}.chart svg{display:block;width:100%;height:auto}
+.tip{position:absolute;pointer-events:none;background:var(--surface-1);border:1px solid var(--border);border-radius:8px;
+padding:8px 10px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:none;white-space:nowrap}
+.tip b{font-weight:600}.badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:4px;border:1px solid var(--border)}
+.ok{color:var(--good)}.bad{color:var(--critical)}
+ul.thesis{margin:4px 0 0;padding-left:18px;color:var(--text-secondary)}
+details summary{cursor:pointer;color:var(--text-secondary)}
+pre{white-space:pre-wrap;font-size:12px;color:var(--text-secondary)}
+"""
+
+CHART_JS = """
+(function(){
+const data=JSON.parse(document.getElementById('nav-data').textContent);
+const root=document.getElementById('nav-chart');if(!data.dates.length){root.innerHTML='<p class="sub">No history yet.</p>';return;}
+const W=1000,H=320,L=48,R=120,T=12,B=28;
+const series=[['portfolio','Portfolio','var(--series-1)','Portfolio'],['spy','SPY','var(--series-2)','SPY'],['universe','Equal-weight universe','var(--series-3)','Universe']];
+let lo=Infinity,hi=-Infinity;series.forEach(([k])=>data[k].forEach(v=>{lo=Math.min(lo,v);hi=Math.max(hi,v)}));
+const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;const n=data.dates.length;
+const x=i=>L+(n<2?0:i*(W-L-R)/(n-1)),y=v=>T+(hi-v)*(H-T-B)/(hi-lo);
+let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Growth of 100: portfolio vs SPY vs equal-weight universe">`;
+for(let k=0;k<=4;k++){const v=lo+(hi-lo)*k/4;s+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/>`+
+`<text x="${L-6}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${v.toFixed(0)}</text>`;}
+[0,Math.floor((n-1)/2),n-1].forEach(i=>{s+=`<text x="${x(i)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${data.dates[i]}</text>`;});
+series.forEach(([k,label,c])=>{const d=data[k].map((v,i)=>(i?'L':'M')+x(i).toFixed(1)+','+y(v).toFixed(1)).join('');
+s+=`<path d="${d}" fill="none" stroke="${c}" stroke-width="2" stroke-linejoin="round"/>`;});
+// direct end labels, nudged apart so they never overlap
+const labels=series.map(([k,,,short])=>({k,short,y:y(data[k][n-1])})).sort((a,b)=>a.y-b.y);
+for(let i=1;i<labels.length;i++){if(labels[i].y-labels[i-1].y<14)labels[i].y=labels[i-1].y+14;}
+labels.forEach(l=>{s+=`<text x="${W-R+8}" y="${l.y+4}" font-size="11" fill="var(--text-secondary)">${l.short} ${data[l.k][n-1].toFixed(1)}</text>`;});
+s+=`<line id="xh" y1="${T}" y2="${H-B}" stroke="var(--text-muted)" stroke-dasharray="3 3" visibility="hidden"/>`;
+series.forEach(([k,,c])=>{s+=`<circle id="dot-${k}" r="4" fill="${c}" stroke="var(--surface-1)" stroke-width="2" visibility="hidden"/>`;});
+s+=`<rect x="${L}" y="${T}" width="${W-L-R}" height="${H-T-B}" fill="transparent" id="hit"/></svg><div class="tip" id="tip"></div>`;
+root.innerHTML=s;const svg=root.querySelector('svg'),tip=root.querySelector('#tip'),xh=root.querySelector('#xh');
+function show(ev){const r=svg.getBoundingClientRect();const px=(ev.clientX-r.left)*W/r.width;
+let i=Math.round((px-L)*(n-1)/(W-L-R));i=Math.max(0,Math.min(n-1,i));xh.setAttribute('x1',x(i));xh.setAttribute('x2',x(i));xh.setAttribute('visibility','visible');
+let h=`<b>${data.dates[i]}</b>`;series.forEach(([k,label,c])=>{const dot=root.querySelector('#dot-'+k);dot.setAttribute('cx',x(i));dot.setAttribute('cy',y(data[k][i]));dot.setAttribute('visibility','visible');
+h+=`<div><span style="color:${c}">●</span> ${label}: ${data[k][i].toFixed(2)}</div>`;});tip.innerHTML=h;tip.style.display='block';
+const tx=x(i)*r.width/W;tip.style.left=Math.min(tx+12,r.width-tip.offsetWidth-4)+'px';tip.style.top='8px';}
+function hide(){tip.style.display='none';xh.setAttribute('visibility','hidden');series.forEach(([k])=>root.querySelector('#dot-'+k).setAttribute('visibility','hidden'));}
+root.querySelector('#hit').addEventListener('pointermove',show);root.querySelector('#hit').addEventListener('pointerleave',hide);
+})();
+"""
+
+
+def _nav_series(db: DB) -> dict[str, list]:
+    rows = db.query("SELECT date, nav, spy_ret, universe_ret FROM nav ORDER BY date")
+    out: dict[str, list] = {"dates": [], "portfolio": [], "spy": [], "universe": []}
+    spy = uni = 100.0
+    for i, r in enumerate(rows):
+        if i:
+            spy *= 1 + (r["spy_ret"] or 0)
+            uni *= 1 + (r["universe_ret"] or 0)
+        out["dates"].append(r["date"])
+        out["portfolio"].append(round(r["nav"] / PORTFOLIO["starting_nav"] * 100, 3))
+        out["spy"].append(round(spy, 3))
+        out["universe"].append(round(uni, 3))
+    return out
+
+
+def build_site(db: DB, out_dir: str) -> None:
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    m = metrics(db)
+    ic = evaluation.ic_summary(db)
+    gate = evaluation.learning_gate(db)
+    cons = evaluation.consistency_rate(db)
+    ground = evaluation.grounding_failure_rate(db)
+    nav_data = _nav_series(db)
+    last_date = db.scalar("SELECT MAX(date) FROM scores")
+    pos = db.query("SELECT * FROM positions ORDER BY value DESC")
+    nav = m.get("nav") or PORTFOLIO["starting_nav"]
+    decisions = db.query("SELECT record FROM decisions ORDER BY date DESC, decision_id LIMIT 40")
+    watch = db.query("SELECT * FROM scores WHERE date = :d ORDER BY composite DESC LIMIT 25", {"d": last_date}) if last_date else []
+    runs = db.query("SELECT * FROM runs ORDER BY started DESC LIMIT 10")
+    closed = db.query("SELECT * FROM closed_positions ORDER BY closed_date DESC LIMIT 20")
+    spend = db.query("SELECT SUBSTR(ts, 1, 7) AS month, SUM(usd) AS usd FROM llm_spend GROUP BY SUBSTR(ts, 1, 7) ORDER BY month DESC LIMIT 6")
+    reports = db.query("SELECT key, value FROM kv WHERE key LIKE 'report:%' ORDER BY key DESC LIMIT 3")
+
+    tiles = [
+        ("NAV", f"${_num(nav, 0)}", f"start ${_num(PORTFOLIO['starting_nav'], 0)}"),
+        ("Total return", _pct(m.get("total_return")), f"SPY {_pct(m.get('spy_total_return'))} · universe {_pct(m.get('universe_total_return'))}"),
+        ("Alpha (ann.)", _pct(m.get("alpha_ann")), f"95% CI ±{_pct(m.get('alpha_ci95')).lstrip('+')}"),
+        ("Sharpe", _num(m.get("sharpe")), f"95% CI ±{_num(m.get('sharpe_ci95'))}"),
+        ("Max drawdown", _pct(m.get("max_drawdown")), f"{m.get('days', 0)} trading days"),
+        ("Rank IC 126d", _num((ic.get(126) or {}).get("mean_ic"), 3), f"{(ic.get(126) or {}).get('days', 0)} resolved days"),
+    ]
+    tiles_html = "".join(f'<div class="tile"><div class="k">{_e(k)}</div><div class="v">{_e(v)}</div><div class="n">{_e(n)}</div></div>' for k, v, n in tiles)
+
+    pos_rows = "".join(
+        f"<tr><td>{_e(p['symbol'])}</td><td>{_e(p['sector'])}</td><td>{_e(p['opened_date'])}</td>"
+        f"<td class='r'>{_num(p['entry_price'])}</td><td class='r'>{_num(p['last_close'])}</td>"
+        f"<td class='r'>{_pct(p['value'] / nav, -1)}</td><td class='r'>{_pct(p['value'] / p['cost'] - 1)}</td></tr>"
+        for p in pos
+    ) or "<tr><td colspan='7' class='sub'>No open positions. The portfolio holds cash until a name passes the screen and the risk overlay.</td></tr>"
+
+    dec_rows = []
+    for row in decisions:
+        r = json.loads(row["record"])
+        c = r.get("computed", {})
+        thesis = "".join(f"<li>{_e(b)}</li>" for b in r.get("thesis", []))
+        reasons = ", ".join(r.get("reasons") or [])
+        check = r.get("checks", {}).get("number_grounding")
+        badge = f"<span class='badge {'ok' if check == 'pass' else 'bad'}'>{_e(check)}</span>" if check != "n/a" else ""
+        dec_rows.append(
+            f"<tr><td>{_e(r['as_of'][:10])}</td><td><b>{_e(r['ticker'])}</b></td><td>{_e(r['action'])}</td>"
+            f"<td class='r'>{_pct(r['target_weight'], -1) if r['target_weight'] else '–'}</td><td class='r'>{_num(r['confidence'])}</td>"
+            f"<td class='r'>{_num(c.get('composite_score'))}</td><td class='r'>{_pct(c.get('mos_band_low'))}</td>"
+            f"<td>{badge}<ul class='thesis'>{thesis}</ul>{'<div class=sub>' + _e(reasons) + '</div>' if reasons else ''}"
+            f"<details><summary>record</summary><pre>{_e(json.dumps(r, indent=1))}</pre></details></td></tr>"
+        )
+    dec_html = "".join(dec_rows) or "<tr><td colspan='8' class='sub'>No decisions yet.</td></tr>"
+
+    watch_rows = "".join(
+        f"<tr><td>{_e(w['symbol'])}</td><td class='r'>{_num(w['composite'])}</td><td class='r'>{_num(w['value_score'])}</td>"
+        f"<td class='r'>{_num(w['quality_score'])}</td><td class='r'>{_num(w['text_score'])}</td><td class='r'>{_pct(w['mos_low'])}</td>"
+        f"<td class='r'>{w['criteria_passed']}/8</td><td class='r'>{_num(w['price'])}</td><td class='r'>{_num(w['iv_mid'])}</td></tr>"
+        for w in watch
+    ) or "<tr><td colspan='9' class='sub'>No scores yet.</td></tr>"
+
+    closed_rows = "".join(
+        f"<tr><td>{_e(c['symbol'])}</td><td>{_e(c['opened_date'])}</td><td>{_e(c['closed_date'])}</td>"
+        f"<td class='r'>{_pct(c['ret'])}</td><td class='r'>{_pct(c['excess_ret'])}</td><td>{_e(', '.join(json.loads(c['tags'] or '[]')))}</td></tr>"
+        for c in closed
+    ) or "<tr><td colspan='6' class='sub'>No closed positions yet.</td></tr>"
+
+    run_rows = "".join(
+        f"<tr><td>{_e((r['started'] or '')[:16].replace('T', ' '))}</td><td>{_e(r['as_of'])}</td>"
+        f"<td class='{'ok' if r['status'] in ('ok', 'market_closed') else 'bad'}'>{_e(r['status'])}</td>"
+        f"<td><details><summary>{len(json.loads(r['notes'] or '[]'))} notes</summary><pre>{_e(chr(10).join(json.loads(r['notes'] or '[]')))}</pre></details></td></tr>"
+        for r in runs
+    )
+
+    health = [
+        ("Thesis grounding failures", _pct(ground["failure_rate"], -1) if ground["failure_rate"] is not None else "–", f"{ground['decisions']} theses · target < 1%"),
+        ("Scoring consistency", _pct(cons["agreement"], -1) if cons["agreement"] is not None else "–", f"{cons['pairs']} re-scored pairs · target ≥ 85%"),
+        ("LLM spend this month", f"${_num(spend[0]['usd'] if spend else 0)}", "cap $10"),
+        ("Learning gate", "unlocked" if gate["unlocked"] else "locked", f"{gate['resolved_days']}/{gate['required_days']} resolved days"),
+    ]
+    health_html = "".join(f'<div class="tile"><div class="k">{_e(k)}</div><div class="v">{_e(v)}</div><div class="n">{_e(n)}</div></div>' for k, v, n in health)
+    report_html = "".join(f"<details><summary>{_e(r['key'][7:])}</summary><pre>{_e(json.loads(r['value']))}</pre></details>" for r in reports) or "<p class='sub'>The first report is written on the 1st of next month.</p>"
+
+    page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AMIA Paper Portfolio</title><style>{CSS}</style></head><body><main>
+<h1>AMIA paper portfolio</h1>
+<p class="sub">Framework {_e(FRAMEWORK_VERSION)} · data through {_e(last_date or '–')} · paper trading only, not investment advice.</p>
+<div class="tiles">{tiles_html}</div>
+<h2>Growth of 100</h2>
+<div class="card"><div class="legend"><span><i style="background:var(--series-1)"></i>Portfolio</span><span><i style="background:var(--series-2)"></i>SPY</span><span><i style="background:var(--series-3)"></i>Equal-weight universe</span></div>
+<div class="chart" id="nav-chart"></div></div>
+<script type="application/json" id="nav-data">{json.dumps(nav_data)}</script>
+<h2>Open positions</h2><div class="card"><table><tr><th>Ticker</th><th>Sector</th><th>Opened</th><th class="r">Entry</th><th class="r">Last</th><th class="r">Weight</th><th class="r">Return</th></tr>{pos_rows}</table></div>
+<h2>Recent decisions</h2><div class="card"><table><tr><th>Date</th><th>Ticker</th><th>Action</th><th class="r">Weight</th><th class="r">Conf.</th><th class="r">Score</th><th class="r">MoS (low)</th><th>Thesis</th></tr>{dec_html}</table></div>
+<h2>Watchlist: top 25 by composite score</h2><div class="card"><table><tr><th>Ticker</th><th class="r">Composite</th><th class="r">Value</th><th class="r">Quality</th><th class="r">Text</th><th class="r">MoS (low)</th><th class="r">Graham</th><th class="r">Price</th><th class="r">IV mid</th></tr>{watch_rows}</table></div>
+<h2>Closed positions</h2><div class="card"><table><tr><th>Ticker</th><th>Opened</th><th>Closed</th><th class="r">Return</th><th class="r">Excess</th><th>Attribution</th></tr>{closed_rows}</table></div>
+<h2>System health</h2><div class="tiles">{health_html}</div>
+<h2>Runs</h2><div class="card"><table><tr><th>Started (UTC)</th><th>As of</th><th>Status</th><th>Notes</th></tr>{run_rows}</table></div>
+<h2>Monthly reports</h2><div class="card">{report_html}</div>
+</main><script>{CHART_JS}</script></body></html>"""
+    (out / "index.html").write_text(page)
+    (out / "data.json").write_text(json.dumps({"metrics": m, "ic": ic, "nav": nav_data}, default=str))

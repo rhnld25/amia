@@ -1,0 +1,39 @@
+name: backfill
+
+# Run by hand once after setup (and again if it reports companies still waiting).
+# Loads index membership, ~20 months of prices, macro series and EDGAR fundamentals.
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Max companies to fetch fundamentals for in this run"
+        required: false
+        default: "1600"
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: amia-db
+  cancel-in-progress: false
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+      ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ".[postgres]"
+      - run: python -m amia backfill --limit ${{ inputs.limit }}
