@@ -13,9 +13,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 _SCHEMA = """
-CREATE TABLE IF NOT EXISTS universe (
-    month TEXT NOT NULL, symbol TEXT NOT NULL, cik TEXT, name TEXT, sector TEXT, index_name TEXT,
-    PRIMARY KEY (month, symbol));
+CREATE TABLE IF NOT EXISTS tickers (
+    key TEXT PRIMARY KEY, ticker TEXT, cik TEXT, title TEXT);
+CREATE TABLE IF NOT EXISTS symbols (
+    symbol TEXT PRIMARY KEY, cik TEXT, name TEXT, sector TEXT, sic TEXT, first_seen TEXT,
+    filings_checked TEXT, no_price_since TEXT);
 CREATE TABLE IF NOT EXISTS prices (
     symbol TEXT NOT NULL, date TEXT NOT NULL, open {REAL}, close {REAL}, ret {REAL},
     PRIMARY KEY (symbol, date));
@@ -38,7 +40,7 @@ CREATE TABLE IF NOT EXISTS text_items (
     status TEXT, batch_id TEXT, recheck INTEGER DEFAULT 0, created_at TEXT);
 CREATE TABLE IF NOT EXISTS text_scores (
     item_id TEXT NOT NULL, score_pass TEXT NOT NULL, item_type TEXT, symbols TEXT, published_at TEXT,
-    novelty INTEGER, sentiment INTEGER, materiality INTEGER, rationale TEXT, citation TEXT,
+    novelty INTEGER, sentiment INTEGER, relevance INTEGER, rationale TEXT, citation TEXT,
     model TEXT, rubric_version TEXT, scored_at TEXT,
     PRIMARY KEY (item_id, score_pass));
 CREATE TABLE IF NOT EXISTS llm_batches (
@@ -48,15 +50,23 @@ CREATE TABLE IF NOT EXISTS llm_spend (
     cache_read INTEGER, cache_write INTEGER, batch INTEGER, usd {REAL});
 CREATE TABLE IF NOT EXISTS macro (
     series TEXT NOT NULL, date TEXT NOT NULL, value {REAL}, PRIMARY KEY (series, date));
-CREATE TABLE IF NOT EXISTS scores (
-    date TEXT NOT NULL, symbol TEXT NOT NULL, composite {REAL}, value_score {REAL}, quality_score {REAL},
-    text_score {REAL}, mos_low {REAL}, iv_mid {REAL}, price {REAL}, criteria_passed INTEGER,
+CREATE TABLE IF NOT EXISTS watchlist (
+    date TEXT NOT NULL, symbol TEXT NOT NULL, rank INTEGER, attention {REAL}, weight {REAL}, items INTEGER,
+    avg_sentiment {REAL}, sentiment_shift {REAL}, max_relevance INTEGER, held INTEGER,
     PRIMARY KEY (date, symbol));
+CREATE TABLE IF NOT EXISTS features (
+    date TEXT NOT NULL, symbol TEXT NOT NULL, sector TEXT, price {REAL}, attention {REAL}, avg_sentiment {REAL},
+    graham_mos {REAL}, graham_passed INTEGER, iv_mid {REAL}, buffett_passed INTEGER, roe_avg {REAL},
+    marks_pendulum INTEGER, mom_12_1 {REAL}, vol {REAL}, beta {REAL}, llm_conf {REAL}, llm_action TEXT,
+    PRIMARY KEY (date, symbol));
+CREATE TABLE IF NOT EXISTS market_state (
+    date TEXT PRIMARY KEY, regime_flags INTEGER, temperature_score INTEGER, record TEXT);
 CREATE TABLE IF NOT EXISTS snapshots (
     hash TEXT PRIMARY KEY, date TEXT, created_at TEXT, data {BLOB});
 CREATE TABLE IF NOT EXISTS decisions (
     decision_id TEXT PRIMARY KEY, as_of TEXT, date TEXT, symbol TEXT, action TEXT, target_weight {REAL},
-    confidence {REAL}, record TEXT, snapshot_hash TEXT, resolve_on TEXT, thesis_ok INTEGER);
+    confidence {REAL}, record TEXT, snapshot_hash TEXT, resolve_on TEXT, thesis_ok INTEGER, executed INTEGER);
+CREATE INDEX IF NOT EXISTS decisions_symbol ON decisions (symbol, date);
 CREATE TABLE IF NOT EXISTS orders (
     order_id TEXT PRIMARY KEY, decision_id TEXT, symbol TEXT, side TEXT, target_weight {REAL},
     created_date TEXT, status TEXT, fill_date TEXT, fill_price {REAL}, amount {REAL});
@@ -65,12 +75,20 @@ CREATE TABLE IF NOT EXISTS positions (
     cost {REAL}, decision_id TEXT, last_close {REAL});
 CREATE TABLE IF NOT EXISTS closed_positions (
     id TEXT PRIMARY KEY, symbol TEXT, sector TEXT, opened_date TEXT, closed_date TEXT,
-    entry_price {REAL}, exit_price {REAL}, ret {REAL}, excess_ret {REAL}, decision_id TEXT, tags TEXT);
+    entry_price {REAL}, exit_price {REAL}, ret {REAL}, excess_ret {REAL}, sector_excess_ret {REAL},
+    decision_id TEXT, exit_decision_id TEXT, tags TEXT);
 CREATE TABLE IF NOT EXISTS nav (
     date TEXT PRIMARY KEY, nav {REAL}, cash {REAL}, invested {REAL}, ret {REAL},
-    spy_ret {REAL}, universe_ret {REAL}, rf_ret {REAL}, turnover {REAL});
+    spy_ret {REAL}, rf_ret {REAL}, turnover {REAL});
 CREATE TABLE IF NOT EXISTS ic (
-    date TEXT NOT NULL, horizon INTEGER NOT NULL, ic {REAL}, n INTEGER, PRIMARY KEY (date, horizon));
+    date TEXT NOT NULL, horizon INTEGER NOT NULL, lens TEXT NOT NULL, ic {REAL}, n INTEGER,
+    PRIMARY KEY (date, horizon, lens));
+CREATE TABLE IF NOT EXISTS postmortems (
+    id TEXT PRIMARY KEY, month TEXT, case_type TEXT, symbol TEXT, sector TEXT, decision_id TEXT,
+    cause TEXT, lens TEXT, adjustment TEXT, explanation TEXT, lesson TEXT, excess_ret {REAL}, record TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS lessons (
+    lesson_id TEXT PRIMARY KEY, sector TEXT, lens TEXT, adjustment TEXT, guidance TEXT, evidence TEXT,
+    n_cases INTEGER, status TEXT, created_month TEXT);
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY, kind TEXT, as_of TEXT, started TEXT, finished TEXT, status TEXT, notes TEXT);
 CREATE TABLE IF NOT EXISTS kv (

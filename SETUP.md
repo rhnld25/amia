@@ -1,6 +1,6 @@
 # Deploying AMIA (free tier, runs on its own)
 
-Everything runs on GitHub Actions on a schedule: weekdays at 22:30 UTC, after the US close. Data lives in Supabase, and the dashboard is a GitHub Pages site. Nothing has to stay on at home.
+Everything runs on GitHub Actions on a schedule: weekdays at 22:30 UTC, after the US close, plus a monthly post-mortem job. Data lives in Supabase, and the dashboard is a GitHub Pages site. Nothing has to stay on at home.
 
 Keys never go in the code or in chat. You add each one as an encrypted GitHub secret.
 
@@ -11,7 +11,7 @@ Keys never go in the code or in chat. You add each one as an encrypted GitHub se
 | **Supabase** (supabase.com) | Create a project and choose a region near `us-east`. Save the database password you set. | `DATABASE_URL` |
 | **Alpaca** (alpaca.markets) | Sign up and open the **Paper Trading** dashboard. Under API Keys, click Generate. | `ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY` |
 | **FRED** (fred.stlouisfed.org) | My Account → API Keys → Request API Key | `FRED_API_KEY` |
-| **Anthropic** (console.anthropic.com) | Create an API key, add about $5 of credit, and set a monthly spend limit of $10 under Limits | `ANTHROPIC_API_KEY` |
+| **OpenRouter** (openrouter.ai) | Sign up, buy about $5 of credits, then create an API key under **Keys** and give it a $10 credit limit | `OPENROUTER_API_KEY` |
 | **SEC EDGAR** | No account. The SEC requires a contact email in each request. | `SEC_CONTACT_EMAIL` |
 
 ### The Supabase connection string
@@ -47,7 +47,7 @@ gh secret set FRED_API_KEY
 ```
 
 ```bash
-gh secret set ANTHROPIC_API_KEY
+gh secret set OPENROUTER_API_KEY
 ```
 
 ```bash
@@ -62,16 +62,17 @@ Go to **Settings → Pages → Build and deployment → Source** and choose **Gi
 
 ## 4. First run
 
-1. Under **Actions → backfill → Run workflow**, run it once. It loads index membership, about 20 months of prices, macro data and EDGAR fundamentals for about 1,500 companies. That takes roughly 30–60 minutes. If its output says companies are "still waiting", run it again.
-2. Under **Actions → daily → Run workflow**, leave the date empty. When it finishes, the dashboard URL appears on the `deploy` job and under Settings → Pages.
+1. Under **Actions → backfill → Run workflow**, run it once. It loads the SEC ticker map, 3 years of macro data and benchmark prices, then scores the last 7 days of news so there's a watchlist from day one. Scoring runs 8 calls at a time, so this takes about 15–40 minutes and costs well under $1.
+2. Under **Actions → daily → Run workflow**, leave the date empty. The first run fetches prices and SEC fundamentals for the watchlist names, so it takes longer than later runs. When it finishes, the dashboard URL appears on the `deploy` job and under Settings → Pages.
 3. After that it runs by itself every weekday.
 
 ## What to expect
 
 - **Alerts** arrive as GitHub issues labelled `amia-alert`, and GitHub emails them to you. Failed workflow runs are emailed too.
-- **Cash at first.** The portfolio starts in cash. Few large US companies pass Graham's defensive screen with a 25% margin of safety, so it can stay mostly in cash for a long time. That's the framework working, not a bug.
-- **Learning stays locked** until about 6 months of 126-day predictions have resolved.
-- **Cost:** about $2–5/month in Anthropic usage. Everything else is free tier.
+- **A watchlist that moves.** It follows the news: names enter when they get material, novel coverage and fade out over about a week when the story goes quiet.
+- **Buys only above the confidence bar.** The model must reach 0.60 confidence of beating SPY over six months, plus 0.05 for each regime or crowding flag, and at most 3 new positions a day. Blocked buys appear on the dashboard with the reason.
+- **Lessons take time.** Post-mortems start once trades close or reach six months. A lesson needs at least 3 agreeing post-mortems in a sector.
+- **Cost:** about $6/month in OpenRouter usage (Qwen models), with a hard $10 cap. Everything else is free tier.
 
 ## If something breaks
 
@@ -80,5 +81,6 @@ Go to **Settings → Pages → Build and deployment → Source** and choose **Gi
 | `subscription does not permit querying recent SIP data` | Alpaca's free-plan terms changed. Switching to a paid price feed is a small change in `amia/data/live.py`. |
 | News fetch failed alert | Alpaca news may no longer be free on the Basic plan. Scoring continues with filings only. |
 | `could not translate host name` / connection timeout | `DATABASE_URL` is the direct connection. Use the Session pooler URI. |
-| Universe refresh failed alert | A Wikipedia table layout changed. The previous month's membership stays in use. |
+| Empty watchlist | No scored news yet: check the backfill ran, and that the news feed isn't failing (an alert says so). |
+| "LLM budget cap reached" alert | The $10 cap stopped scoring or reviews for the month. Raise `AMIA_LLM_MONTHLY_CAP_USD` or wait for the 1st. |
 | No runs for 60+ days | GitHub pauses schedules on inactive public repos. The monthly job commits a heartbeat to prevent this. If they're paused anyway, re-enable them under Actions. |

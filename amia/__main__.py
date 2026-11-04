@@ -6,7 +6,7 @@ import argparse
 import json
 import logging
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .config import BENCHMARKS, Settings
@@ -23,8 +23,8 @@ def main() -> None:
     d = sub.add_parser("daily", help="run the daily pipeline")
     d.add_argument("--date", default=None)
     d.add_argument("--facts-limit", type=int, default=200)
-    b = sub.add_parser("backfill", help="fetch universe, price history and fundamentals")
-    b.add_argument("--limit", type=int, default=600)
+    b = sub.add_parser("backfill", help="load macro history and score the last week of news to seed the watchlist")
+    b.add_argument("--days", type=int, default=7)
     m = sub.add_parser("monthly", help="write the monthly evaluation report")
     m.add_argument("--date", default=None)
     s = sub.add_parser("build-site", help="render the dashboard to ./site")
@@ -55,11 +55,13 @@ def main() -> None:
         print(json.dumps(pipe.daily(args.date or _today_ny(), args.facts_limit), default=str, indent=2))
     elif args.cmd == "backfill":
         as_of = _today_ny()
-        members = pipe.members(as_of)
-        pipe.update_prices([m["symbol"] for m in members] + BENCHMARKS, as_of)
+        pipe.ticker_map(as_of)
+        pipe.update_prices(BENCHMARKS, as_of)
         pipe.update_macro(as_of)
-        n = pipe.refresh_facts(members, args.limit)
-        print(json.dumps({"members": len(members), "facts_fetched": n, "notes": pipe.notes}, indent=2))
+        since = (date.fromisoformat(as_of) - timedelta(days=args.days)).isoformat() + "T00:00:00Z"
+        pipe.ingest_news(as_of, live_clock=True, always=set(), since=since, cap=8000)
+        pipe.score_text(wait_minutes=90)
+        print(json.dumps({"notes": pipe.notes}, indent=2))
     elif args.cmd == "monthly":
         print(pipe.monthly_report(args.date or _today_ny()))
     elif args.cmd == "simulate":

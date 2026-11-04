@@ -16,6 +16,8 @@ DURATION_CONCEPTS = [
     "RevenueFromContractWithCustomerExcludingAssessedTax",
     "SalesRevenueNet",
     "NetIncomeLoss",
+    "NetCashProvidedByUsedInOperatingActivities",
+    "PaymentsToAcquirePropertyPlantAndEquipment",
     "CommonStockDividendsPerShareDeclared",
     "CommonStockDividendsPerShareCashPaid",
     "PaymentsOfDividendsCommonStock",
@@ -137,6 +139,16 @@ class Edgar:
             headers={"User-Agent": f"AMIA research {contact_email}", "Accept-Encoding": "gzip, deflate"},
             min_interval=0.12,  # SEC fair access: at most 10 requests per second
         )
+        self._submissions: dict[str, dict[str, Any]] = {}
+
+    def submissions(self, cik: str) -> dict[str, Any]:
+        if cik not in self._submissions:
+            self._submissions[cik] = self.http.json(f"https://data.sec.gov/submissions/CIK{cik}.json")
+        return self._submissions[cik]
+
+    def company_profile(self, cik: str) -> dict[str, Any]:
+        d = self.submissions(cik)
+        return {"name": d.get("name"), "sic": d.get("sic"), "sic_description": d.get("sicDescription")}
 
     def ticker_map(self) -> dict[str, dict[str, Any]]:
         data = self.http.json("https://www.sec.gov/files/company_tickers.json")
@@ -156,8 +168,7 @@ class Edgar:
         return extract_facts(cik, payload)
 
     def recent_filings(self, cik: str, since: str) -> list[dict[str, Any]]:
-        data = self.http.json(f"https://data.sec.gov/submissions/CIK{cik}.json")
-        r = data.get("filings", {}).get("recent", {})
+        r = self.submissions(cik).get("filings", {}).get("recent", {})
         out = []
         for i, form in enumerate(r.get("form", [])):
             if form not in SCORED_FORMS or r["filingDate"][i] < since:

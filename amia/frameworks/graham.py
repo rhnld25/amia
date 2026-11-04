@@ -2,6 +2,7 @@
 
 Every input is deterministic: EPS and balance-sheet items from filings known at `as_of`,
 g from a capped 5-year EPS CAGR, Y from the AAA corporate yield. No estimates, no LLM.
+The result is one input to the decision, not a gate.
 """
 
 from __future__ import annotations
@@ -80,10 +81,6 @@ class GrahamResult:
     @property
     def criteria_passed(self) -> int:
         return sum(1 for v in self.criteria.values() if v)
-
-    @property
-    def screen_pass(self) -> bool:
-        return self.criteria_passed >= FRAMEWORK["min_criteria_for_pass"]
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -167,14 +164,3 @@ def evaluate(pit: dict[str, dict[str, float]], price: float, aaa_yield: float) -
         res.iv_low, res.iv_high = min(band), max(band)
         res.mos_band_low = 1 - price / res.iv_low
     return res
-
-
-def value_score(mos_low: float | None) -> float:
-    """0-4: linear in the band-low margin of safety, 4 at >= 30%."""
-    if mos_low is None or mos_low <= 0:
-        return 0.0
-    return min(4.0, mos_low * 4 / 0.30)
-
-
-def quality_score(res: GrahamResult) -> float:
-    return 4.0 * res.criteria_passed / len(CRITERIA)

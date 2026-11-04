@@ -1,4 +1,5 @@
-"""Macro & risk overlay: deterministic hard limits and threshold adjustments."""
+"""Component 3: macro & risk overlay. Deterministic hard limits, and the confidence the reasoning model
+must reach before a new position, raised in crowded sectors and stressed regimes."""
 
 from __future__ import annotations
 
@@ -6,11 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import stats
-from .config import FRAMEWORK, RISK
+from .config import DECISION, RISK
 
 
 def regime_flags(macro: dict[str, list[tuple[str, float]]]) -> list[str]:
-    """Each flag raises the buy threshold by one step."""
+    """Each flag raises the required confidence for new positions by one step."""
     flags = []
     curve = macro.get("T10Y2Y") or []
     if curve and curve[-1][1] < 0:
@@ -66,20 +67,13 @@ class PortfolioState:
         return sum(w * self.betas.get(s, 1.0) for s, w in self.weights.items())
 
 
-def threshold_for(sector: str, state: PortfolioState, regime: list[str]) -> tuple[float, list[str]]:
+def required_confidence(sector: str, state: PortfolioState, regime: list[str]) -> tuple[float, list[str]]:
     reasons = list(regime)
     steps = len(regime)
     if state.sector_weight(sector) > RISK["crowded_sector_weight"]:
         steps += 1
         reasons.append(f"{sector} weight {state.sector_weight(sector):.0%} above crowding level")
-    return FRAMEWORK["base_threshold"] + steps * FRAMEWORK["threshold_step"], reasons
-
-
-def target_weight(vol: float | None, median_vol: float | None) -> float:
-    w = FRAMEWORK["base_weight"]
-    if vol and median_vol:
-        w *= median_vol / vol
-    return round(min(w, FRAMEWORK["max_position_weight"]), 4)
+    return round(DECISION["base_confidence"] + steps * DECISION["confidence_step"], 3), reasons
 
 
 def check_buy(
@@ -94,10 +88,12 @@ def check_buy(
     corr = avg_pairwise_corr(held + [symbol], rets) if len(held) >= 2 else None
     d["avg_corr_after"] = round(corr, 3) if corr is not None else None
     failures = []
-    if weight > FRAMEWORK["max_position_weight"]:
+    if weight > DECISION["max_position_weight"]:
         failures.append("position limit")
     if d["sector_weight_after"] > RISK["max_sector_weight"]:
         failures.append("sector limit")
+    if sector == "Unknown" and d["sector_weight_after"] > RISK["max_unknown_sector_weight"]:
+        failures.append("unknown-sector limit")
     if d["beta_after"] > RISK["max_portfolio_beta"]:
         failures.append("beta limit")
     if corr is not None and corr > RISK["max_avg_pairwise_corr"]:

@@ -1,6 +1,6 @@
 name: monthly
 
-# 1st of each month: evaluation report. It also commits a heartbeat file, because GitHub
+# 1st of each month: post-mortems, lessons and the evaluation report. It also commits a heartbeat file, because GitHub
 # disables scheduled workflows in public repos after 60 days without repository activity.
 on:
   schedule:
@@ -25,6 +25,8 @@ jobs:
       FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
       ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
       ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      AMIA_LLM_MONTHLY_CAP_USD: ${{ vars.AMIA_LLM_MONTHLY_CAP_USD || '10' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4

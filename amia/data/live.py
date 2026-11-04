@@ -1,4 +1,4 @@
-"""Live providers: SEC EDGAR, FRED, Alpaca (prices and news), Wikipedia (index membership)."""
+"""Live providers: SEC EDGAR, FRED, Alpaca (prices and news)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from typing import Any
 from ..config import Settings
 from .edgar import Edgar
 from .http import HttpClient
-from .universe import fetch_universe
 
 ALPACA_DATA = "https://data.alpaca.markets"
 
@@ -27,12 +26,12 @@ class LiveProviders:
             min_interval=0.35,  # free plan: 200 requests per minute
         )
         self.fred = HttpClient(min_interval=0.6)
-        self._ticker_map: dict[str, dict[str, Any]] | None = None
 
-    def universe(self, month: str) -> list[dict[str, Any]]:
-        if self._ticker_map is None:
-            self._ticker_map = self.edgar.ticker_map()
-        return fetch_universe(self.settings.sec_contact_email, self._ticker_map)
+    def ticker_map(self) -> dict[str, dict[str, Any]]:
+        return self.edgar.ticker_map()
+
+    def company_profile(self, cik: str) -> dict[str, Any]:
+        return self.edgar.company_profile(cik)
 
     def _bars(self, symbols: list[str], start: str, adjustment: str) -> dict[str, list[dict[str, Any]]]:
         out: dict[str, list[dict[str, Any]]] = {}

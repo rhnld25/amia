@@ -7,3 +7,4 @@ __pycache__/
 amia_local.db
 site/
 local_data/
+.DS_Store

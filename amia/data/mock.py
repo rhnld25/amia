@@ -12,7 +12,13 @@ from typing import Any
 from ..config import BENCHMARKS, SECTOR_ETFS
 
 SECTORS = list(SECTOR_ETFS.keys())
+SECTOR_SIC = {
+    "Information Technology": "3674", "Financials": "6022", "Health Care": "2834", "Consumer Discretionary": "5651",
+    "Consumer Staples": "2080", "Energy": "1311", "Industrials": "3560", "Materials": "2800", "Utilities": "4911",
+    "Real Estate": "6798", "Communication Services": "4813",
+}
 BASE_DATE = date(2023, 1, 2)
+NO_SEC = "NOSEC"  # trades and gets news, but files nothing with the SEC
 
 
 def _rng(*parts: Any) -> random.Random:
@@ -30,7 +36,7 @@ def trading_days(start: date, end: date) -> list[date]:
 
 
 COMPANIES = [
-    {"symbol": f"MK{i:02d}", "cik": str(9_000_000 + i).zfill(10), "name": f"Mock Corp {i:02d}", "sector": SECTORS[i % len(SECTORS)]}
+    {"symbol": f"Q{chr(65 + i // 26)}{chr(65 + i % 26)}", "cik": str(9_000_000 + i).zfill(10), "name": f"Mock Corp {i:02d}", "sector": SECTORS[i % len(SECTORS)]}
     for i in range(40)
 ]
 _BY_SYMBOL = {c["symbol"]: c for c in COMPANIES}
@@ -68,8 +74,12 @@ def _market_ret(d: date) -> float:
 @lru_cache(maxsize=None)
 def _path(symbol: str) -> dict[date, tuple[float, float, float]]:
     """(open, close, ret) by day from BASE_DATE to 2030."""
-    p = _profile(symbol) if symbol in _BY_SYMBOL else {"beta": 1.0, "vol": 0.004, "pe": 20, "eps0": 20}
-    price = p["eps0"] * p["pe"] if symbol in _BY_SYMBOL else 100.0 + 10 * BENCHMARKS.index(symbol)
+    if symbol in _BY_SYMBOL or symbol == NO_SEC:
+        p = _profile(symbol)
+        price = p["eps0"] * p["pe"]
+    else:
+        p = {"beta": 1.0, "vol": 0.004}
+        price = 100.0 + 10 * BENCHMARKS.index(symbol)
     out = {}
     for d in trading_days(BASE_DATE, date(2030, 12, 31)):
         r = _rng("ret", symbol, d)
@@ -81,13 +91,19 @@ def _path(symbol: str) -> dict[date, tuple[float, float, float]]:
 
 
 class MockProviders:
-    def universe(self, month: str) -> list[dict[str, Any]]:
-        return [{**c, "index_name": "MOCK"} for c in COMPANIES]
+    def ticker_map(self) -> dict[str, dict[str, Any]]:
+        return {c["symbol"]: {"cik": c["cik"], "ticker": c["symbol"], "title": c["name"]} for c in COMPANIES}
+
+    def company_profile(self, cik: str) -> dict[str, Any]:
+        c = _BY_CIK[cik]
+        return {"name": c["name"], "sic": SECTOR_SIC[c["sector"]], "sic_description": c["sector"]}
 
     def daily_bars(self, symbols: list[str], start: str, end: str) -> dict[str, list[dict[str, Any]]]:
         s, e = date.fromisoformat(start[:10]), date.fromisoformat(end[:10])
         out = {}
         for sym in symbols:
+            if sym not in _BY_SYMBOL and sym not in BENCHMARKS and sym != NO_SEC:
+                continue  # unknown ticker: no price data, like an untradable symbol
             path = _path(sym)
             out[sym] = [
                 {"date": d.isoformat(), "open": o, "close": c, "ret": r}
@@ -97,7 +113,7 @@ class MockProviders:
         return out
 
     def macro(self, series: str, start: str, end: str) -> list[tuple[str, float]]:
-        base = {"DAAA": 5.5, "AAA": 5.5, "BAMLH0A0HYM2": 3.5, "T10Y2Y": 0.3, "DFF": 4.0, "DTB3": 4.0}[series]
+        base = {"DAAA": 5.5, "AAA": 5.5, "BAMLH0A0HYM2": 3.5, "T10Y2Y": 0.3, "DFF": 4.0, "DTB3": 4.0, "DGS10": 4.2}[series]
         s, e = date.fromisoformat(start), date.fromisoformat(end)
         out = []
         for d in trading_days(max(s, BASE_DATE - timedelta(days=400)), e):
@@ -142,14 +158,18 @@ class MockProviders:
             div = round(max(0.0, eps * 0.4), 2) if p["quality"] > 0.3 else 0.0
             ca = 2e9 * (1 + p["quality"])
             cl = ca / (1.2 + 2 * p["quality"])
+            revenue = 1e9 * (1 + p["growth"]) ** (year - 2010)
             for concept, value, start in [
                 ("EarningsPerShareDiluted", eps, f"{year}-01-01"),
-                ("Revenues", 1e9 * (1 + p["growth"]) ** (year - 2010), f"{year}-01-01"),
+                ("NetIncomeLoss", eps * shares, f"{year}-01-01"),
+                ("NetCashProvidedByUsedInOperatingActivities", eps * shares * (1.1 + p["quality"] * 0.3), f"{year}-01-01"),
+                ("PaymentsToAcquirePropertyPlantAndEquipment", revenue * 0.04, f"{year}-01-01"),
+                ("Revenues", revenue, f"{year}-01-01"),
                 ("CommonStockDividendsPerShareDeclared", div, f"{year}-01-01"),
                 ("AssetsCurrent", ca, None),
                 ("LiabilitiesCurrent", cl, None),
                 ("LongTermDebtNoncurrent", (ca - cl) * (1.6 - p["quality"]), None),
-                ("StockholdersEquity", eps * shares * 8, None),
+                ("StockholdersEquity", abs(eps) * shares * (4 + 6 * (1 - p["quality"])), None),
                 ("EntityCommonStockSharesOutstanding", shares, None),
             ]:
                 rows.append(
@@ -172,21 +192,35 @@ class MockProviders:
         return f"{_BY_CIK[cik]['name']} {form}. Management's discussion and analysis: the quarter showed {tone}."
 
     def news(self, start: str, end: str) -> list[dict[str, Any]]:
+        """Themes rotate every two weeks: a handful of names get heavy, keyword-rich coverage, the rest get
+        occasional items. Roundups tagging many tickers, keyword-free chatter and non-equity symbols are noise."""
         s, e = date.fromisoformat(start[:10]), date.fromisoformat(end[:10])
+        names = [c["symbol"] for c in COMPANIES] + [NO_SEC]
+        good = ["beats estimates and raises guidance", "wins long-term supply contract", "receives FDA approval for lead product", "announces record buyback"]
+        bad = ["faces product recall", "announces CEO departure", "cuts outlook on weaker orders", "discloses SEC investigation"]
         out = []
         for d in trading_days(s, e):
+            theme = _rng("theme", d.toordinal() // 14)
+            hot = theme.sample(names, 6)
             r = _rng("news", d)
-            for k in range(r.randint(0, 3)):
-                sym = r.choice(COMPANIES)["symbol"]
-                tone = r.choice(["beats estimates and raises guidance", "announces CEO departure", "wins long-term supply contract", "faces product recall"])
-                out.append(
-                    {
-                        "id": f"{d:%Y%m%d}{k}",
-                        "symbols": [sym],
-                        "created_at": f"{d.isoformat()}T14:30:00Z",
-                        "headline": f"{sym} {tone}",
-                        "summary": f"{_BY_SYMBOL[sym]['name']} {tone}.",
-                        "url": "",
-                    }
-                )
-        return out
+            k = 0
+            for sym in hot + [r.choice(names) for _ in range(r.randint(0, 3))]:
+                tone = r.choice(good if _rng("tone", sym, d.toordinal() // 14).random() < 0.6 else bad)
+                out.append(self._item(d, k, [sym], f"{sym} {tone}"))
+                k += 1
+            out.append(self._item(d, k, r.sample(names, 8), "Stocks moving in today's session: beats, misses and guidance"))
+            out.append(self._item(d, k + 1, [r.choice(names)], "Shares trade sideways in light volume"))
+            out.append(self._item(d, k + 2, ["BTCUSD"], "Bitcoin earnings season approval rally"))
+        return [n for n in out if start <= n["created_at"] <= end]
+
+    @staticmethod
+    def _item(d: date, k: int, symbols: list[str], headline: str) -> dict[str, Any]:
+        name = _BY_SYMBOL[symbols[0]]["name"] if symbols[0] in _BY_SYMBOL else symbols[0]
+        return {
+            "id": f"{d:%Y%m%d}{k:02d}",
+            "symbols": symbols,
+            "created_at": f"{d.isoformat()}T14:30:00Z",
+            "headline": headline,
+            "summary": f"{name}: {headline}.",
+            "url": "",
+        }

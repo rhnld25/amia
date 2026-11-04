@@ -1,10 +1,9 @@
 [project]
 name = "amia"
 version = "0.1.0"
-description = "Autonomous Market Intelligence Analyst: point-in-time quantamental research with a paper portfolio"
+description = "Autonomous Market Intelligence Analyst: news-driven discovery, Graham/Buffett/Marks math, LLM decisions, paper portfolio"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=2.4",
     "httpx>=0.28",
     "sqlalchemy>=2.0",
 ]
@@ -21,7 +20,7 @@ build-backend = "setuptools.build_meta"
 include = ["amia*"]
 
 [tool.setuptools.package-data]
-amia = ["rubrics/*.md"]
+amia = ["rubrics/*.md", "principles/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

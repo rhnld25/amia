@@ -1,14 +1,14 @@
 name: backfill
 
-# Run by hand once after setup (and again if it reports companies still waiting).
-# Loads index membership, ~20 months of prices, macro series and EDGAR fundamentals.
+# Run by hand once after setup. Loads the SEC ticker map, macro history and benchmark prices,
+# and scores the last week of news so the first daily run starts with a watchlist.
 on:
   workflow_dispatch:
     inputs:
-      limit:
-        description: "Max companies to fetch fundamentals for in this run"
+      days:
+        description: "Days of news to score"
         required: false
-        default: "1600"
+        default: "7"
 
 permissions:
   contents: read
@@ -21,13 +21,15 @@ concurrency:
 jobs:
   backfill:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 150
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
       FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
       ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
       ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      AMIA_LLM_MONTHLY_CAP_USD: ${{ vars.AMIA_LLM_MONTHLY_CAP_USD || '10' }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -36,4 +38,4 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: pip install ".[postgres]"
-      - run: python -m amia backfill --limit ${{ inputs.limit }}
+      - run: python -m amia backfill --days ${{ inputs.days }}

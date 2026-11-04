@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from . import evaluation
-from .config import FRAMEWORK_VERSION, PORTFOLIO
+from .config import EVALUATION, FRAMEWORK_VERSION, PORTFOLIO, SECTOR_ETFS
 from .db import DB
 from .portfolio import metrics
 
@@ -17,7 +17,16 @@ from .portfolio import metrics
 def _pct(v: Any, digits: int = 1) -> str:
     if v is None or (isinstance(v, float) and math.isnan(v)):
         return "–"
-    return f"{v * 100:+.{digits}f}%" if digits >= 0 else f"{v * 100:.0f}%"
+    if digits >= 0:
+        return f"{v * 100:+.{digits}f}%"
+    return f"{v * 100:.1f}".rstrip("0").rstrip(".") + "%"  # unsigned, up to one decimal (2.5%, 6%)
+
+
+def _mos(v: Any) -> str:
+    """Graham margin of safety (1 - price / value). Far above value, a multiple reads better than -4731%."""
+    if v is None:
+        return "–"
+    return f"{1 - v:.1f}× value" if v < -1 else _pct(v, 0)
 
 
 def _num(v: Any, digits: int = 2) -> str:
@@ -69,11 +78,11 @@ CHART_JS = """
 const data=JSON.parse(document.getElementById('nav-data').textContent);
 const root=document.getElementById('nav-chart');if(!data.dates.length){root.innerHTML='<p class="sub">No history yet.</p>';return;}
 const W=1000,H=320,L=48,R=120,T=12,B=28;
-const series=[['portfolio','Portfolio','var(--series-1)','Portfolio'],['spy','SPY','var(--series-2)','SPY'],['universe','Equal-weight universe','var(--series-3)','Universe']];
+const series=[['portfolio','Portfolio','var(--series-1)','Portfolio'],['spy','SPY','var(--series-2)','SPY'],['cash','T-bills (cash)','var(--series-3)','Cash']];
 let lo=Infinity,hi=-Infinity;series.forEach(([k])=>data[k].forEach(v=>{lo=Math.min(lo,v);hi=Math.max(hi,v)}));
 const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;const n=data.dates.length;
 const x=i=>L+(n<2?0:i*(W-L-R)/(n-1)),y=v=>T+(hi-v)*(H-T-B)/(hi-lo);
-let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Growth of 100: portfolio vs SPY vs equal-weight universe">`;
+let s=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Growth of 100: portfolio vs SPY vs T-bills">`;
 for(let k=0;k<=4;k++){const v=lo+(hi-lo)*k/4;s+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--grid)"/>`+
 `<text x="${L-6}" y="${y(v)+4}" text-anchor="end" font-size="11" fill="var(--text-muted)">${v.toFixed(0)}</text>`;}
 [0,Math.floor((n-1)/2),n-1].forEach(i=>{s+=`<text x="${x(i)}" y="${H-8}" text-anchor="middle" font-size="11" fill="var(--text-muted)">${data.dates[i]}</text>`;});
@@ -99,18 +108,53 @@ root.querySelector('#hit').addEventListener('pointermove',show);root.querySelect
 
 
 def _nav_series(db: DB) -> dict[str, list]:
-    rows = db.query("SELECT date, nav, spy_ret, universe_ret FROM nav ORDER BY date")
-    out: dict[str, list] = {"dates": [], "portfolio": [], "spy": [], "universe": []}
-    spy = uni = 100.0
+    rows = db.query("SELECT date, nav, spy_ret, rf_ret FROM nav ORDER BY date")
+    out: dict[str, list] = {"dates": [], "portfolio": [], "spy": [], "cash": []}
+    spy = cash = 100.0
     for i, r in enumerate(rows):
         if i:
             spy *= 1 + (r["spy_ret"] or 0)
-            uni *= 1 + (r["universe_ret"] or 0)
+            cash *= 1 + (r["rf_ret"] or 0)
         out["dates"].append(r["date"])
         out["portfolio"].append(round(r["nav"] / PORTFOLIO["starting_nav"] * 100, 3))
         out["spy"].append(round(spy, 3))
-        out["universe"].append(round(uni, 3))
+        out["cash"].append(round(cash, 3))
     return out
+
+
+def _sector_etf_returns(db: DB, start: str | None, end: str | None) -> list[tuple[str, str, float | None]]:
+    out = []
+    for sector, etf in SECTOR_ETFS.items():
+        ret = None
+        if start and end:
+            vals = [r["ret"] for r in db.query("SELECT ret FROM prices WHERE symbol = :s AND date > :a AND date <= :b", {"s": etf, "a": start, "b": end}) if r["ret"] is not None]
+            if vals:
+                level = 1.0
+                for v in vals:
+                    level *= 1 + v
+                ret = level - 1
+        out.append((etf, sector, ret))
+    return out
+
+
+OUTCOME_LABEL = {
+    "EXECUTED": "executed",
+    "NO_TRADE": "no trade",
+    "SKIP_CONFIDENCE": "below required confidence",
+    "SKIP_RISK": "blocked by risk limits",
+    "SKIP_DAILY_LIMIT": "daily buy limit reached",
+    "REJECTED_GROUNDING": "rejected: thesis numbers not in data",
+    "REJECTED_SCHEMA": "rejected: malformed answer",
+}
+
+LENS_LABEL = {
+    "llm_conf": "Model confidence",
+    "attention": "News attention",
+    "graham_mos": "Graham margin of safety",
+    "buffett_passed": "Buffett quality criteria",
+    "marks_pendulum": "Marks pendulum (greed +)",
+    "mom_12_1": "12-1 month momentum",
+}
 
 
 def build_site(db: DB, out_dir: str) -> None:
@@ -118,27 +162,35 @@ def build_site(db: DB, out_dir: str) -> None:
     out.mkdir(parents=True, exist_ok=True)
     m = metrics(db)
     ic = evaluation.ic_summary(db)
-    gate = evaluation.learning_gate(db)
     cons = evaluation.consistency_rate(db)
     ground = evaluation.grounding_failure_rate(db)
     nav_data = _nav_series(db)
-    last_date = db.scalar("SELECT MAX(date) FROM scores")
+    last_date = db.scalar("SELECT MAX(date) FROM watchlist")
     pos = db.query("SELECT * FROM positions ORDER BY value DESC")
     nav = m.get("nav") or PORTFOLIO["starting_nav"]
-    decisions = db.query("SELECT record FROM decisions ORDER BY date DESC, decision_id LIMIT 40")
-    watch = db.query("SELECT * FROM scores WHERE date = :d ORDER BY composite DESC LIMIT 25", {"d": last_date}) if last_date else []
+    decisions = db.query("SELECT record FROM decisions WHERE action IN ('ACCUMULATE', 'EXIT') ORDER BY date DESC, decision_id LIMIT 40")
+    review_counts = db.query("SELECT action, COUNT(*) AS n FROM decisions GROUP BY action")
+    watch = db.query(
+        "SELECT w.*, s.name, s.sector, f.graham_passed, f.graham_mos, f.buffett_passed, f.marks_pendulum, f.llm_action, f.llm_conf, f.price "
+        "FROM watchlist w LEFT JOIN symbols s ON s.symbol = w.symbol LEFT JOIN features f ON f.symbol = w.symbol AND f.date = w.date "
+        "WHERE w.date = :d ORDER BY w.rank IS NULL, w.rank",
+        {"d": last_date},
+    ) if last_date else []
     runs = db.query("SELECT * FROM runs ORDER BY started DESC LIMIT 10")
     closed = db.query("SELECT * FROM closed_positions ORDER BY closed_date DESC LIMIT 20")
     spend = db.query("SELECT SUBSTR(ts, 1, 7) AS month, SUM(usd) AS usd FROM llm_spend GROUP BY SUBSTR(ts, 1, 7) ORDER BY month DESC LIMIT 6")
     reports = db.query("SELECT key, value FROM kv WHERE key LIKE 'report:%' ORDER BY key DESC LIMIT 3")
+    lessons = db.query("SELECT * FROM lessons WHERE status = 'active' ORDER BY created_month DESC")
+    pms = db.query("SELECT * FROM postmortems ORDER BY created_at DESC LIMIT 15")
+    llm_ic = (ic.get("llm_conf") or {}).get(EVALUATION["decision_horizon"]) or {}
 
     tiles = [
         ("NAV", f"${_num(nav, 0)}", f"start ${_num(PORTFOLIO['starting_nav'], 0)}"),
-        ("Total return", _pct(m.get("total_return")), f"SPY {_pct(m.get('spy_total_return'))} · universe {_pct(m.get('universe_total_return'))}"),
-        ("Alpha (ann.)", _pct(m.get("alpha_ann")), f"95% CI ±{_pct(m.get('alpha_ci95')).lstrip('+')}"),
+        ("Total return", _pct(m.get("total_return")), f"SPY {_pct(m.get('spy_total_return'))} · T-bills {_pct(m.get('cash_total_return'))}"),
+        ("Alpha vs SPY (ann.)", _pct(m.get("alpha_ann")), f"beta-adjusted · 95% CI ±{_pct(m.get('alpha_ci95')).lstrip('+')}"),
         ("Sharpe", _num(m.get("sharpe")), f"95% CI ±{_num(m.get('sharpe_ci95'))}"),
         ("Max drawdown", _pct(m.get("max_drawdown")), f"{m.get('days', 0)} trading days"),
-        ("Rank IC 126d", _num((ic.get(126) or {}).get("mean_ic"), 3), f"{(ic.get(126) or {}).get('days', 0)} resolved days"),
+        ("Model confidence IC, 126d", _num(llm_ic.get("mean_ic"), 3), f"{llm_ic.get('days', 0)} resolved days"),
     ]
     tiles_html = "".join(f'<div class="tile"><div class="k">{_e(k)}</div><div class="v">{_e(v)}</div><div class="n">{_e(n)}</div></div>' for k, v, n in tiles)
 
@@ -147,37 +199,75 @@ def build_site(db: DB, out_dir: str) -> None:
         f"<td class='r'>{_num(p['entry_price'])}</td><td class='r'>{_num(p['last_close'])}</td>"
         f"<td class='r'>{_pct(p['value'] / nav, -1)}</td><td class='r'>{_pct(p['value'] / p['cost'] - 1)}</td></tr>"
         for p in pos
-    ) or "<tr><td colspan='7' class='sub'>No open positions. The portfolio holds cash until a name passes the screen and the risk overlay.</td></tr>"
+    ) or "<tr><td colspan='7' class='sub'>No open positions yet.</td></tr>"
 
     dec_rows = []
     for row in decisions:
         r = json.loads(row["record"])
-        c = r.get("computed", {})
         thesis = "".join(f"<li>{_e(b)}</li>" for b in r.get("thesis", []))
-        reasons = ", ".join(r.get("reasons") or [])
-        check = r.get("checks", {}).get("number_grounding")
-        badge = f"<span class='badge {'ok' if check == 'pass' else 'bad'}'>{_e(check)}</span>" if check != "n/a" else ""
+        views = r.get("framework_views") or {}
+        views_html = "".join(f"<li><b>{_e(k.title())}:</b> {_e(v)}</li>" for k, v in views.items() if v)
+        lessons_used = r.get("lessons_applied") or []
+        outcome = r.get("outcome", "")
+        ok = outcome == "EXECUTED"
         dec_rows.append(
-            f"<tr><td>{_e(r['as_of'][:10])}</td><td><b>{_e(r['ticker'])}</b></td><td>{_e(r['action'])}</td>"
-            f"<td class='r'>{_pct(r['target_weight'], -1) if r['target_weight'] else '–'}</td><td class='r'>{_num(r['confidence'])}</td>"
-            f"<td class='r'>{_num(c.get('composite_score'))}</td><td class='r'>{_pct(c.get('mos_band_low'))}</td>"
-            f"<td>{badge}<ul class='thesis'>{thesis}</ul>{'<div class=sub>' + _e(reasons) + '</div>' if reasons else ''}"
-            f"<details><summary>record</summary><pre>{_e(json.dumps(r, indent=1))}</pre></details></td></tr>"
+            f"<tr><td>{_e(r['as_of'][:10])}</td><td><b>{_e(r['ticker'])}</b><div class='sub'>{_e(r.get('sector'))}</div></td><td>{_e(r['action'])}</td>"
+            f"<td><span class='badge {'ok' if ok else 'bad'}'>{_e(OUTCOME_LABEL.get(outcome, outcome))}</span></td>"
+            f"<td class='r'>{_pct(r['target_allocation'], -1) if r['target_allocation'] else '–'}</td>"
+            f"<td class='r'>{_num(r['confidence'])}<div class='sub'>{'needs ' + _num(r['required_confidence']) if r.get('required_confidence') else ''}</div></td>"
+            f"<td><ul class='thesis'>{thesis}</ul>"
+            f"<details><summary>framework views{' · lessons applied' if lessons_used else ''}</summary><ul class='thesis'>{views_html}"
+            f"{''.join(f'<li><b>Lesson:</b> {_e(x)}</li>' for x in lessons_used)}</ul></details>"
+            f"<details><summary>full record</summary><pre>{_e(json.dumps(r, indent=1))}</pre></details></td></tr>"
         )
-    dec_html = "".join(dec_rows) or "<tr><td colspan='8' class='sub'>No decisions yet.</td></tr>"
+    dec_html = "".join(dec_rows) or "<tr><td colspan='7' class='sub'>No buy or exit decisions yet.</td></tr>"
+    counts = {r["action"]: r["n"] for r in review_counts}
+    review_note = f"{sum(counts.values())} reviews so far: " + ", ".join(f"{n} {a.lower()}" for a, n in sorted(counts.items())) if counts else "No reviews yet."
+
+    def _pend(v: Any) -> str:
+        return "–" if v is None else {2: "greed ++", 1: "greed", 0: "neutral", -1: "fear", -2: "fear ++"}.get(int(v), str(v))
 
     watch_rows = "".join(
-        f"<tr><td>{_e(w['symbol'])}</td><td class='r'>{_num(w['composite'])}</td><td class='r'>{_num(w['value_score'])}</td>"
-        f"<td class='r'>{_num(w['quality_score'])}</td><td class='r'>{_num(w['text_score'])}</td><td class='r'>{_pct(w['mos_low'])}</td>"
-        f"<td class='r'>{w['criteria_passed']}/8</td><td class='r'>{_num(w['price'])}</td><td class='r'>{_num(w['iv_mid'])}</td></tr>"
+        f"<tr><td class='r'>{_e(w['rank'] or 'held')}</td><td><b>{_e(w['symbol'])}</b><div class='sub'>{_e(w['name'] or '')}</div></td><td>{_e(w['sector'])}</td>"
+        f"<td class='r'>{_pct(w['weight'], -1)}</td><td class='r'>{_e(w['items'])}</td><td class='r'>{_num(w['avg_sentiment'], 1)}</td>"
+        f"<td class='r'>{_num(w['sentiment_shift'], 1)}</td>"
+        f"<td class='r'>{(str(w['graham_passed']) + '/8') if w['graham_passed'] is not None else '–'}</td>"
+        f"<td class='r'>{_mos(w['graham_mos'])}</td>"
+        f"<td class='r'>{(str(w['buffett_passed']) + '/5') if w['buffett_passed'] is not None else '–'}</td>"
+        f"<td>{_pend(w['marks_pendulum'])}</td><td>{_e(w['llm_action'] or '–')}</td><td class='r'>{_num(w['llm_conf'])}</td></tr>"
         for w in watch
-    ) or "<tr><td colspan='9' class='sub'>No scores yet.</td></tr>"
+    ) or "<tr><td colspan='13' class='sub'>The watchlist fills once news has been scored.</td></tr>"
+
+    ic_rows = "".join(
+        f"<tr><td>{_e(LENS_LABEL.get(lens, lens))}</td>"
+        + "".join(f"<td class='r'>{_num(v['mean_ic'], 3)}</td><td class='r'>{_num(v['t_stat_overlap_adj'], 1)}</td><td class='r'>{v['days']}</td>" for v in by_h.values())
+        + "</tr>"
+        for lens, by_h in ic.items()
+    )
+    ic_head = "".join(f"<th class='r'>IC {h}d</th><th class='r'>t</th><th class='r'>days</th>" for h in EVALUATION["horizons"])
+
+    etf_rows = "".join(
+        f"<tr><td>{_e(etf)}</td><td>{_e(sector)}</td><td class='r'>{_pct(ret)}</td></tr>"
+        for etf, sector, ret in _sector_etf_returns(db, m.get("start"), m.get("end"))
+    )
 
     closed_rows = "".join(
         f"<tr><td>{_e(c['symbol'])}</td><td>{_e(c['opened_date'])}</td><td>{_e(c['closed_date'])}</td>"
-        f"<td class='r'>{_pct(c['ret'])}</td><td class='r'>{_pct(c['excess_ret'])}</td><td>{_e(', '.join(json.loads(c['tags'] or '[]')))}</td></tr>"
+        f"<td class='r'>{_pct(c['ret'])}</td><td class='r'>{_pct(c['excess_ret'])}</td><td class='r'>{_pct(c['sector_excess_ret'])}</td>"
+        f"<td>{_e(', '.join(json.loads(c['tags'] or '[]')))}</td></tr>"
         for c in closed
-    ) or "<tr><td colspan='6' class='sub'>No closed positions yet.</td></tr>"
+    ) or "<tr><td colspan='7' class='sub'>No closed positions yet.</td></tr>"
+
+    lesson_rows = "".join(
+        f"<tr><td>{_e(lsn['created_month'])}</td><td>{_e(lsn['sector'])}</td><td>{_e(lsn['lens'])} {_e(lsn['adjustment'].replace('_', ' '))}</td>"
+        f"<td>{_e(lsn['guidance'])}</td><td class='r'>{lsn['n_cases']}</td></tr>"
+        for lsn in lessons
+    ) or "<tr><td colspan='5' class='sub'>No lessons yet. A lesson needs several agreeing post-mortems.</td></tr>"
+    pm_rows = "".join(
+        f"<tr><td>{_e(p['month'])}</td><td>{_e(p['symbol'])}</td><td>{_e(p['case_type'].replace('_', ' '))}</td><td class='r'>{_pct(p['excess_ret'])}</td>"
+        f"<td>{_e(p['cause'].replace('_', ' '))}</td><td>{_e(p['explanation'])}</td></tr>"
+        for p in pms
+    ) or "<tr><td colspan='6' class='sub'>The first post-mortems run on the 1st of the month after a trade closes.</td></tr>"
 
     run_rows = "".join(
         f"<tr><td>{_e((r['started'] or '')[:16].replace('T', ' '))}</td><td>{_e(r['as_of'])}</td>"
@@ -187,10 +277,10 @@ def build_site(db: DB, out_dir: str) -> None:
     )
 
     health = [
-        ("Thesis grounding failures", _pct(ground["failure_rate"], -1) if ground["failure_rate"] is not None else "–", f"{ground['decisions']} theses · target < 1%"),
+        ("Thesis grounding failures", _pct(ground["failure_rate"], -1) if ground["failure_rate"] is not None else "–", f"{ground['decisions']} reviews · target < 1%"),
         ("Scoring consistency", _pct(cons["agreement"], -1) if cons["agreement"] is not None else "–", f"{cons['pairs']} re-scored pairs · target ≥ 85%"),
         ("LLM spend this month", f"${_num(spend[0]['usd'] if spend else 0)}", "cap $10"),
-        ("Learning gate", "unlocked" if gate["unlocked"] else "locked", f"{gate['resolved_days']}/{gate['required_days']} resolved days"),
+        ("Active lessons", str(len(lessons)), f"{len(pms)} recent post-mortems"),
     ]
     health_html = "".join(f'<div class="tile"><div class="k">{_e(k)}</div><div class="v">{_e(v)}</div><div class="n">{_e(n)}</div></div>' for k, v, n in health)
     report_html = "".join(f"<details><summary>{_e(r['key'][7:])}</summary><pre>{_e(json.loads(r['value']))}</pre></details>" for r in reports) or "<p class='sub'>The first report is written on the 1st of next month.</p>"
@@ -198,16 +288,21 @@ def build_site(db: DB, out_dir: str) -> None:
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMIA Paper Portfolio</title><style>{CSS}</style></head><body><main>
 <h1>AMIA paper portfolio</h1>
-<p class="sub">Framework {_e(FRAMEWORK_VERSION)} · data through {_e(last_date or '–')} · paper trading only, not investment advice.</p>
+<p class="sub">Framework {_e(FRAMEWORK_VERSION)} · data through {_e(last_date or '–')} · watchlist from news traction · decisions by Qwen (via OpenRouter) within code-enforced risk limits · paper trading only, not investment advice.</p>
 <div class="tiles">{tiles_html}</div>
 <h2>Growth of 100</h2>
-<div class="card"><div class="legend"><span><i style="background:var(--series-1)"></i>Portfolio</span><span><i style="background:var(--series-2)"></i>SPY</span><span><i style="background:var(--series-3)"></i>Equal-weight universe</span></div>
+<div class="card"><div class="legend"><span><i style="background:var(--series-1)"></i>Portfolio</span><span><i style="background:var(--series-2)"></i>SPY</span><span><i style="background:var(--series-3)"></i>T-bills (cash)</span></div>
 <div class="chart" id="nav-chart"></div></div>
 <script type="application/json" id="nav-data">{json.dumps(nav_data)}</script>
 <h2>Open positions</h2><div class="card"><table><tr><th>Ticker</th><th>Sector</th><th>Opened</th><th class="r">Entry</th><th class="r">Last</th><th class="r">Weight</th><th class="r">Return</th></tr>{pos_rows}</table></div>
-<h2>Recent decisions</h2><div class="card"><table><tr><th>Date</th><th>Ticker</th><th>Action</th><th class="r">Weight</th><th class="r">Conf.</th><th class="r">Score</th><th class="r">MoS (low)</th><th>Thesis</th></tr>{dec_html}</table></div>
-<h2>Watchlist: top 25 by composite score</h2><div class="card"><table><tr><th>Ticker</th><th class="r">Composite</th><th class="r">Value</th><th class="r">Quality</th><th class="r">Text</th><th class="r">MoS (low)</th><th class="r">Graham</th><th class="r">Price</th><th class="r">IV mid</th></tr>{watch_rows}</table></div>
-<h2>Closed positions</h2><div class="card"><table><tr><th>Ticker</th><th>Opened</th><th>Closed</th><th class="r">Return</th><th class="r">Excess</th><th>Attribution</th></tr>{closed_rows}</table></div>
+<h2>Buy and exit decisions</h2><p class="sub">{_e(review_note)}</p><div class="card"><table><tr><th>Date</th><th>Ticker</th><th>Action</th><th>Outcome</th><th class="r">Allocation</th><th class="r">Confidence</th><th>Thesis</th></tr>{dec_html}</table></div>
+<h2>Today's watchlist (from news traction)</h2><div class="card"><table><tr><th class="r">#</th><th>Ticker</th><th>Sector</th><th class="r">Attention</th><th class="r">Items</th><th class="r">Sentiment</th><th class="r">Shift</th><th class="r">Graham</th><th class="r">MoS</th><th class="r">Buffett</th><th>Marks</th><th>Last review</th><th class="r">Conf.</th></tr>{watch_rows}</table></div>
+<h2>Which inputs predict returns vs SPY</h2><p class="sub">Rank correlation between each input and later return against SPY, across the watchlist. Near zero means no predictive value; it takes months to mean anything.</p>
+<div class="card"><table><tr><th>Input</th>{ic_head}</tr>{ic_rows}</table></div>
+<h2>Sector ETFs over the same period</h2><div class="card"><table><tr><th>ETF</th><th>Sector</th><th class="r">Return</th></tr>{etf_rows}</table></div>
+<h2>Closed positions</h2><div class="card"><table><tr><th>Ticker</th><th>Opened</th><th>Closed</th><th class="r">Return</th><th class="r">vs SPY</th><th class="r">vs sector ETF</th><th>Attribution</th></tr>{closed_rows}</table></div>
+<h2>Lessons</h2><div class="card"><table><tr><th>Since</th><th>Sector</th><th>Adjustment</th><th>Guidance</th><th class="r">Cases</th></tr>{lesson_rows}</table></div>
+<h2>Post-mortems</h2><div class="card"><table><tr><th>Month</th><th>Ticker</th><th>Case</th><th class="r">vs SPY</th><th>Cause</th><th>Explanation</th></tr>{pm_rows}</table></div>
 <h2>System health</h2><div class="tiles">{health_html}</div>
 <h2>Runs</h2><div class="card"><table><tr><th>Started (UTC)</th><th>As of</th><th>Status</th><th>Notes</th></tr>{run_rows}</table></div>
 <h2>Monthly reports</h2><div class="card">{report_html}</div>

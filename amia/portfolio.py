@@ -23,8 +23,8 @@ def last_nav(db: DB) -> float:
     return float(v) if v is not None else PORTFOLIO["starting_nav"]
 
 
-def _slippage(index_name: str | None) -> float:
-    return PORTFOLIO["slippage_large"] if index_name in ("SP500", "MOCK") else PORTFOLIO["slippage_small"]
+def _slippage(size: str | None) -> float:
+    return PORTFOLIO["slippage_large"] if size == "large" else PORTFOLIO["slippage_small"]
 
 
 def run_day(
@@ -32,10 +32,9 @@ def run_day(
     date: str,
     bars: dict[str, dict[str, Any]],
     prev_close: dict[str, float],
-    index_of: dict[str, str],
+    size_of: dict[str, str],
     sector_of: dict[str, str],
     spy_ret: float | None,
-    universe_ret: float | None,
     rf_annual_pct: float | None,
 ) -> dict[str, Any]:
     """Fill pending orders at today's open, mark everything to today's close, append a NAV row."""
@@ -53,7 +52,7 @@ def run_day(
         bar = bars.get(sym)
         if not bar or not bar.get("open"):
             continue  # no trade today (halt or missing data); retry tomorrow
-        slip = _slippage(index_of.get(sym))
+        slip = _slippage(size_of.get(sym))
         if o["side"] == "BUY" and sym not in pos:
             amount = min(o["target_weight"] * nav_prev, c)
             if amount <= 0:
@@ -100,7 +99,9 @@ def run_day(
                         "exit_price": exit_price,
                         "ret": ret,
                         "excess_ret": None,
+                        "sector_excess_ret": None,
                         "decision_id": p["decision_id"],
+                        "exit_decision_id": o["decision_id"],
                         "tags": None,
                     }
                 ],
@@ -138,7 +139,6 @@ def run_day(
                 "invested": invested,
                 "ret": nav / nav_prev - 1,
                 "spy_ret": spy_ret,
-                "universe_ret": universe_ret,
                 "rf_ret": rf_daily,
                 "turnover": traded / nav_prev if nav_prev else 0,
             }
@@ -149,13 +149,14 @@ def run_day(
 
 
 def metrics(db: DB) -> dict[str, Any]:
+    """Absolute return, beta-adjusted alpha vs SPY, drawdown and Sharpe, with intervals that show how
+    little a short record proves."""
     rows = db.query("SELECT * FROM nav ORDER BY date")
     if len(rows) < 2:
         return {"days": len(rows)}
     rets = [r["ret"] for r in rows[1:]]
     rf = [r["rf_ret"] or 0 for r in rows[1:]]
     spy = [r["spy_ret"] for r in rows[1:]]
-    uni = [r["universe_ret"] for r in rows[1:]]
     n = len(rets)
     years = n / 252
     excess = [a - b for a, b in zip(rets, rf)]
@@ -179,7 +180,7 @@ def metrics(db: DB) -> dict[str, Any]:
         "turnover_ann": sum(r["turnover"] or 0 for r in rows) / years if years else float("nan"),
         "invested_frac": rows[-1]["invested"] / rows[-1]["nav"] if rows[-1]["nav"] else 0,
     }
-    paired = [(x, y, f) for x, y, f in zip(uni, rets, rf) if x is not None]
+    paired = [(x, y, f) for x, y, f in zip(spy, rets, rf) if x is not None]
     if len(paired) >= 20:
         xs = [x - f for x, _, f in paired]
         ys = [y - f for _, y, f in paired]
@@ -189,22 +190,17 @@ def metrics(db: DB) -> dict[str, Any]:
             {
                 "alpha_ann": a * 252,
                 "alpha_ci95": 1.96 * a_se * 252,
-                "beta_universe": b,
+                "beta_spy": b,
                 "tracking_error": te,
                 # years of data needed for a 3%/yr alpha to reach t = 2 at the current tracking error
                 "years_needed_3pct_alpha": (2 * te / 0.03) ** 2 if te == te else float("nan"),
             }
         )
-    spy_pairs = [(x, y) for x, y in zip(spy, rets) if x is not None]
-    if len(spy_pairs) >= 20:
-        _, b, _, _ = stats.ols([x for x, _ in spy_pairs], [y for _, y in spy_pairs])
-        out["beta_spy"] = b
-    cum = {"portfolio": 1.0, "spy": 1.0, "universe": 1.0}
+    cum = {"spy": 1.0, "cash": 1.0}
     for r in rows[1:]:
-        cum["portfolio"] *= 1 + r["ret"]
         cum["spy"] *= 1 + (r["spy_ret"] or 0)
-        cum["universe"] *= 1 + (r["universe_ret"] or 0)
+        cum["cash"] *= 1 + (r["rf_ret"] or 0)
     out["spy_total_return"] = cum["spy"] - 1
-    out["universe_total_return"] = cum["universe"] - 1
-    out["horizon_note"] = f"{years:.2f} years of history; decision horizon is {EVALUATION['decision_horizon']} trading days"
+    out["cash_total_return"] = cum["cash"] - 1
+    out["horizon_note"] = f"{years:.2f} years of history; decisions are judged over {EVALUATION['decision_horizon']} trading days"
     return out
