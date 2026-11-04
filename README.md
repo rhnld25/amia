@@ -39,7 +39,7 @@ These numbers come from a live run on November 3, 2026, on real market data. The
 | Scoring one news item for novelty, sentiment and relevance | $0.00002 | ~50,000 items |
 | One investment memo: reasoning over a ~3,200-token dossier, a thesis, three framework views, risks | $0.006 | ~170 memos |
 | A full daily cycle: 40 memos, plus data, checks, portfolio and dashboard | ~$0.27 | |
-| Daily run time with 4 memos written at once | 12 min | |
+| Daily run time, measured with 4 memos written at once (now 8) | 12 min | |
 
 **How it stays this cheap:**
 - **It only runs when there's work.** A scheduled job wakes up after the close, does the day's work and exits. Paying for an always-on server would be the expensive part, and AMIA doesn't need one.
@@ -90,11 +90,11 @@ Performance is measured forward only, on live paper results: alpha against SPY, 
 ## How a day runs
 
 1. **News and filings.** It fetches all Alpaca news since the last run and drops roundups and items without high-impact keywords. It also picks up new EDGAR filings for watched companies.
-2. **Fast-tier scoring.** Qwen 3.7 Flash scores each item 0–4 for novelty, sentiment and strategic relevance, running 8 calls in parallel.
+2. **Fast-tier scoring.** Qwen 3.7 Flash scores each item 0–4 for novelty, sentiment and strategic relevance, running 32 calls in parallel.
 3. **Watchlist.** It takes the top 40 names by attention. Held positions always stay on.
 4. **Fills.** Yesterday's orders fill at today's open plus slippage, and every position is marked to the close.
 5. **Framework math.** It computes Graham, Buffett, Marks, momentum, volatility and beta for every watchlist name.
-6. **Memos.** Qwen 3.7 Plus reviews each name that needs it, 4 at a time.
+6. **Memos.** Qwen 3.7 Plus reviews each name that needs it, 8 at a time.
 7. **Code checks.** It checks the answer's format, number grounding, the confidence bar and the risk limits.
 8. **Evaluation.** It updates the per-input IC and tags closed positions with likely causes.
 9. **Dashboard.** It rebuilds the static page and publishes it to GitHub Pages.

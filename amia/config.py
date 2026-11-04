@@ -79,7 +79,7 @@ DECISION = {
     "review_stale_days": 5,  # re-review a name at least this often while it stays on the watchlist
     "review_price_move": 0.05,  # or sooner after a move this large
     "max_reviews_per_day": 60,
-    "parallel_reviews": 4,  # reasoning calls in flight at once
+    "parallel_reviews": 8,  # reasoning calls in flight at once
     "max_news_in_dossier": 8,
 }
 
@@ -173,6 +173,8 @@ class Settings:
     decision_model: str = field(default_factory=lambda: os.environ.get("AMIA_DECISION_MODEL", "qwen/qwen3.7-plus"))
     llm_monthly_cap_usd: float = field(default_factory=lambda: float(os.environ.get("AMIA_LLM_MONTHLY_CAP_USD", "10")))
     batch_wait_minutes: int = field(default_factory=lambda: int(os.environ.get("AMIA_BATCH_WAIT_MINUTES", "20")))
+    # scoring calls in flight at once; each waits ~1 s on the model, so throughput scales with this until rate limits
+    scoring_workers: int = field(default_factory=lambda: int(os.environ.get("AMIA_SCORING_WORKERS", "32")))
     github_token: str = field(default_factory=lambda: os.environ.get("GITHUB_TOKEN", ""))
     github_repository: str = field(default_factory=lambda: os.environ.get("GITHUB_REPOSITORY", ""))
     db_size_alert_mb: int = 400

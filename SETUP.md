@@ -62,7 +62,7 @@ Go to **Settings → Pages → Build and deployment → Source** and choose **Gi
 
 ## 4. First run
 
-1. Under **Actions → backfill → Run workflow**, run it once. It loads the SEC ticker map, 3 years of macro data and benchmark prices, then scores the last 7 days of news so there's a watchlist from day one. Scoring runs 8 calls at a time, so this takes about 15–40 minutes and costs well under $1.
+1. Under **Actions → backfill → Run workflow**, run it once. It loads the SEC ticker map, 3 years of macro data and benchmark prices, then scores the last 7 days of news so there's a watchlist from day one. Scoring runs 32 calls at a time, so this takes about 10–15 minutes and costs well under $1.
 2. Under **Actions → daily → Run workflow**, leave the date empty. The first run fetches prices and SEC fundamentals for the watchlist names, so it takes longer than later runs. When it finishes, the dashboard URL appears on the `deploy` job and under Settings → Pages.
 3. After that it runs by itself every weekday.
 

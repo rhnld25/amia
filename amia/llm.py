@@ -138,7 +138,6 @@ def principles_text() -> str:
 
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-SCORING_WORKERS = 8
 
 
 def cost_usd(model: str, usage: dict[str, Any]) -> float:
@@ -279,7 +278,7 @@ class LLM:
             results = {i["custom_id"]: fake_score(i["body"]) for i in items}
         else:
             results = {}
-            with ThreadPoolExecutor(max_workers=SCORING_WORKERS) as pool:
+            with ThreadPoolExecutor(max_workers=self.settings.scoring_workers) as pool:
                 for item, (score, usage, model) in zip(items, pool.map(self._score_one, items)):
                     results[item["custom_id"]] = score
                     if usage:
