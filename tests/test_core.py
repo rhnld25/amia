@@ -128,6 +128,15 @@ def test_attention_decays_and_watchlist_keeps_held():
     assert build_watchlist(t, set(), eligible={"OLD"}) == []
 
 
+
+def test_share_classes_take_one_watchlist_slot():
+    row = lambda a: {"attention": a, "items": 5, "avg_sentiment": 2.0, "sentiment_shift": 0.0, "max_relevance": 3}
+    t = {"GOOG": row(3.3), "GOOGL": row(3.1), "AAPL": row(7.0)}
+    cik = {"GOOG": "0001652044", "GOOGL": "0001652044", "AAPL": "0000320193"}
+    assert [w["symbol"] for w in build_watchlist(t, set(), company=cik)] == ["AAPL", "GOOG"]
+    # the class already held keeps the slot, even with less attention
+    assert [w["symbol"] for w in build_watchlist(t, {"GOOGL"}, company=cik)] == ["AAPL", "GOOGL"]
+
 def _dossier(held=None):
     return {
         "ticker": "XYZ", "sector": "Energy", "held": held,

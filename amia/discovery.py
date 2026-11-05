@@ -71,16 +71,34 @@ def attention_table(items: list[dict[str, Any]], as_of: str) -> dict[str, dict[s
     return out
 
 
-def build_watchlist(table: dict[str, dict[str, Any]], held: set[str], eligible: set[str] | None = None) -> list[dict[str, Any]]:
-    """Top names by attention (above the floor), plus every held name. `eligible` filters out untradable tickers."""
-    ranked = sorted(
+def build_watchlist(
+    table: dict[str, dict[str, Any]],
+    held: set[str],
+    eligible: set[str] | None = None,
+    company: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Top names by attention (above the floor), plus every held name. `eligible` filters out untradable tickers.
+
+    `company` maps a symbol to its SEC CIK. Share classes of one company (GOOG/GOOGL) take one slot: the held
+    class if there is one, otherwise the class with the most attention.
+    """
+    company = company or {}
+    ordered = sorted(
         (
             (s, row)
             for s, row in table.items()
             if row["attention"] >= DISCOVERY["min_attention"] and (eligible is None or s in eligible)
         ),
-        key=lambda x: (-x[1]["attention"], x[0]),
-    )[: DISCOVERY["watchlist_size"]]
+        key=lambda x: (x[0] not in held, -x[1]["attention"], x[0]),
+    )
+    seen: set[str] = set()
+    ranked = []
+    for s, row in ordered:
+        key = company.get(s) or s
+        if key not in seen:
+            seen.add(key)
+            ranked.append((s, row))
+    ranked = sorted(ranked, key=lambda x: (-x[1]["attention"], x[0]))[: DISCOVERY["watchlist_size"]]
     chosen = {s for s, _ in ranked}
     total = sum(row["attention"] for _, row in ranked) or 1.0
     out = [

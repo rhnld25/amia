@@ -324,13 +324,14 @@ class Pipeline:
         # look at twice the list size so names without prices can be replaced
         candidates = sorted((s for s, r in table.items() if r["attention"] >= DISCOVERY["min_attention"]), key=lambda s: -table[s]["attention"])
         candidates = candidates[: 2 * DISCOVERY["watchlist_size"]]
-        self.ensure_profiles(candidates + sorted(held), tmap, as_of)
+        profiles = self.ensure_profiles(candidates + sorted(held), tmap, as_of)
         self.update_prices(candidates, as_of)
         priced = {r["symbol"] for r in self.db.query("SELECT DISTINCT symbol FROM prices WHERE date >= :d", {"d": _minus(as_of, 7)})}
         unpriced = [s for s in candidates if s not in priced]
         if unpriced:
             self.notes.append(f"no price data, left off the watchlist: {', '.join(unpriced[:15])}")
-        wl = build_watchlist(table, held, eligible=priced)
+        company = {s: p["cik"] for s, p in profiles.items() if p.get("cik")}
+        wl = build_watchlist(table, held, eligible=priced, company=company)
         self.db.execute("DELETE FROM watchlist WHERE date = :d", {"d": as_of})
         self.db.upsert(
             "watchlist",
