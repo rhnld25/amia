@@ -69,7 +69,7 @@ class LiveProviders:
                     break
                 r = raw_by_day.get(day)
                 if prev is not None and r is not None and prev > 0:
-                    rows.append({"date": day, "open": r["o"], "close": r["c"], "ret": b["c"] / prev - 1})
+                    rows.append({"date": day, "open": r["o"], "close": r["c"], "ret": b["c"] / prev - 1, "volume": r.get("v")})
                 prev = b["c"]
             out[sym] = rows
         return out

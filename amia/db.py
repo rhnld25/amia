@@ -9,7 +9,7 @@ import json
 from collections.abc import Iterable, Sequence
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine
 
 _SCHEMA = """
@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS symbols (
     symbol TEXT PRIMARY KEY, cik TEXT, name TEXT, sector TEXT, sic TEXT, first_seen TEXT,
     filings_checked TEXT, no_price_since TEXT);
 CREATE TABLE IF NOT EXISTS prices (
-    symbol TEXT NOT NULL, date TEXT NOT NULL, open {REAL}, close {REAL}, ret {REAL},
+    symbol TEXT NOT NULL, date TEXT NOT NULL, open {REAL}, close {REAL}, ret {REAL}, volume {REAL},
     PRIMARY KEY (symbol, date));
 CREATE INDEX IF NOT EXISTS prices_date ON prices (date);
 CREATE TABLE IF NOT EXISTS facts (
@@ -113,6 +113,12 @@ class DB:
             for stmt in ddl.split(";"):
                 if stmt.strip():
                     conn.execute(text(stmt))
+        # columns added after the first deploy
+        for table, col, typ in [("prices", "volume", types["REAL"])]:
+            have = {c["name"] for c in inspect(self.engine).get_columns(table)}
+            if col not in have:
+                with self.engine.begin() as conn:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {typ}"))
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> None:
         with self.engine.begin() as conn:

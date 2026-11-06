@@ -76,20 +76,22 @@ def build_watchlist(
     held: set[str],
     eligible: set[str] | None = None,
     company: dict[str, str] | None = None,
+    dollar_volume: dict[str, float] | None = None,
 ) -> list[dict[str, Any]]:
     """Top names by attention (above the floor), plus every held name. `eligible` filters out untradable tickers.
 
-    `company` maps a symbol to its SEC CIK. Share classes of one company (GOOG/GOOGL) take one slot: the held
-    class if there is one, otherwise the class with the most attention.
+    `company` maps a symbol to its SEC CIK. Share classes of one company (GOOG/GOOGL) move together, so they take
+    one slot: the most actively traded class by `dollar_volume`, or by attention where volume isn't known yet.
+    A held class that loses the slot stays on as a held name.
     """
-    company = company or {}
+    company, dollar_volume = company or {}, dollar_volume or {}
     ordered = sorted(
         (
             (s, row)
             for s, row in table.items()
             if row["attention"] >= DISCOVERY["min_attention"] and (eligible is None or s in eligible)
         ),
-        key=lambda x: (x[0] not in held, -x[1]["attention"], x[0]),
+        key=lambda x: (-(dollar_volume.get(x[0]) or 0.0), -x[1]["attention"], x[0]),
     )
     seen: set[str] = set()
     ranked = []

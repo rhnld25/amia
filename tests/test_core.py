@@ -133,9 +133,12 @@ def test_share_classes_take_one_watchlist_slot():
     row = lambda a: {"attention": a, "items": 5, "avg_sentiment": 2.0, "sentiment_shift": 0.0, "max_relevance": 3}
     t = {"GOOG": row(3.3), "GOOGL": row(3.1), "AAPL": row(7.0)}
     cik = {"GOOG": "0001652044", "GOOGL": "0001652044", "AAPL": "0000320193"}
-    assert [w["symbol"] for w in build_watchlist(t, set(), company=cik)] == ["AAPL", "GOOG"]
-    # the class already held keeps the slot, even with less attention
-    assert [w["symbol"] for w in build_watchlist(t, {"GOOGL"}, company=cik)] == ["AAPL", "GOOGL"]
+    assert [w["symbol"] for w in build_watchlist(t, set(), company=cik)] == ["AAPL", "GOOG"]  # no volume yet: attention
+    # the more actively traded class takes the slot; a held class that loses it stays on as held
+    dv = {"GOOG": 3e9, "GOOGL": 5e9}
+    assert [w["symbol"] for w in build_watchlist(t, set(), company=cik, dollar_volume=dv)] == ["AAPL", "GOOGL"]
+    wl = build_watchlist(t, {"GOOG"}, company=cik, dollar_volume=dv)
+    assert [(w["symbol"], w["held"]) for w in wl] == [("AAPL", 0), ("GOOGL", 0), ("GOOG", 1)]
 
 def _dossier(held=None):
     return {

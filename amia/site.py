@@ -5,8 +5,10 @@ from __future__ import annotations
 import html
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import evaluation
 from .config import EVALUATION, FRAMEWORK_VERSION, PORTFOLIO, SECTOR_ETFS
@@ -157,6 +159,26 @@ LENS_LABEL = {
 }
 
 
+def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Intraday watchlist rows, with each name's latest framework numbers and review (from the last close)."""
+    syms = [r["symbol"] for r in rows]
+    if not syms:
+        return []
+    names = {f"s{i}": s for i, s in enumerate(syms)}
+    clause = "(" + ", ".join(f":{k}" for k in names) + ")"
+    info = {r["symbol"]: r for r in db.query(f"SELECT symbol, name, sector FROM symbols WHERE symbol IN {clause}", names)}
+    feats = {
+        r["symbol"]: r
+        for r in db.query(
+            "SELECT f.symbol, f.graham_passed, f.graham_mos, f.buffett_passed, f.marks_pendulum, f.llm_action, f.llm_conf, f.price "
+            f"FROM features f WHERE f.symbol IN {clause} AND f.date = (SELECT MAX(g.date) FROM features g WHERE g.symbol = f.symbol)",
+            names,
+        )
+    }
+    blank = dict.fromkeys(("graham_passed", "graham_mos", "buffett_passed", "marks_pendulum", "llm_action", "llm_conf", "price"))
+    return [{**r, "name": None, "sector": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})} for r in rows]
+
+
 def build_site(db: DB, out_dir: str) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -176,7 +198,20 @@ def build_site(db: DB, out_dir: str) -> None:
         "WHERE w.date = :d ORDER BY w.rank IS NULL, w.rank",
         {"d": last_date},
     ) if last_date else []
-    runs = db.query("SELECT * FROM runs ORDER BY started DESC LIMIT 10")
+    official_rank = {w["symbol"]: w["rank"] for w in watch}
+    live = db.get_kv("watchlist:live")
+    last_close_run = db.scalar("SELECT MAX(finished) FROM runs WHERE kind = 'daily'") or ""
+    if live and live["updated"] > last_close_run:
+        watch = _live_watch(db, live["rows"])
+        updated = datetime.fromisoformat(live["updated"].replace("Z", "+00:00")).astimezone(ZoneInfo("America/New_York"))
+        watch_note = (
+            f"Live: refreshed every 15 minutes in market hours, last at {updated:%b %-d, %-I:%M %p} ET. "
+            f"Move is against the list at the {live['since'] or 'first'} close, which the evening review decides on."
+        )
+    else:
+        watch_note = f"As of the {last_date or '–'} close. During market hours it refreshes every 15 minutes."
+    # intraday refreshes run every 15 minutes; the run log keeps the daily and monthly runs readable
+    runs = db.query("SELECT * FROM runs WHERE kind <> 'intraday' ORDER BY started DESC LIMIT 10")
     closed = db.query("SELECT * FROM closed_positions ORDER BY closed_date DESC LIMIT 20")
     spend = db.query("SELECT SUBSTR(ts, 1, 7) AS month, SUM(usd) AS usd FROM llm_spend GROUP BY SUBSTR(ts, 1, 7) ORDER BY month DESC LIMIT 6")
     reports = db.query("SELECT key, value FROM kv WHERE key LIKE 'report:%' ORDER BY key DESC LIMIT 3")
@@ -227,8 +262,17 @@ def build_site(db: DB, out_dir: str) -> None:
     def _pend(v: Any) -> str:
         return "–" if v is None else {2: "greed ++", 1: "greed", 0: "neutral", -1: "fear", -2: "fear ++"}.get(int(v), str(v))
 
+    def _move(w: dict[str, Any]) -> str:
+        before = official_rank.get(w["symbol"])
+        if not w["rank"] or not official_rank:
+            return "–"
+        if not before:
+            return "<span class='badge ok'>new</span>"
+        d = before - w["rank"]
+        return "–" if d == 0 else (f"▲{d}" if d > 0 else f"▼{-d}")
+
     watch_rows = "".join(
-        f"<tr><td class='r'>{_e(w['rank'] or 'held')}</td><td><b>{_e(w['symbol'])}</b><div class='sub'>{_e(w['name'] or '')}</div></td><td>{_e(w['sector'])}</td>"
+        f"<tr><td class='r'>{_e(w['rank'] or 'held')}</td><td class='r'>{_move(w)}</td><td><b>{_e(w['symbol'])}</b><div class='sub'>{_e(w['name'] or '')}</div></td><td>{_e(w['sector'])}</td>"
         f"<td class='r'>{_pct(w['weight'], -1)}</td><td class='r'>{_e(w['items'])}</td><td class='r'>{_num(w['avg_sentiment'], 1)}</td>"
         f"<td class='r'>{_num(w['sentiment_shift'], 1)}</td>"
         f"<td class='r'>{(str(w['graham_passed']) + '/8') if w['graham_passed'] is not None else '–'}</td>"
@@ -236,7 +280,7 @@ def build_site(db: DB, out_dir: str) -> None:
         f"<td class='r'>{(str(w['buffett_passed']) + '/5') if w['buffett_passed'] is not None else '–'}</td>"
         f"<td>{_pend(w['marks_pendulum'])}</td><td>{_e(w['llm_action'] or '–')}</td><td class='r'>{_num(w['llm_conf'])}</td></tr>"
         for w in watch
-    ) or "<tr><td colspan='13' class='sub'>The watchlist fills once news has been scored.</td></tr>"
+    ) or "<tr><td colspan='14' class='sub'>The watchlist fills once news has been scored.</td></tr>"
 
     ic_rows = "".join(
         f"<tr><td>{_e(LENS_LABEL.get(lens, lens))}</td>"
@@ -296,7 +340,7 @@ def build_site(db: DB, out_dir: str) -> None:
 <script type="application/json" id="nav-data">{json.dumps(nav_data)}</script>
 <h2>Open positions</h2><div class="card"><table><tr><th>Ticker</th><th>Sector</th><th>Opened</th><th class="r">Entry</th><th class="r">Last</th><th class="r">Weight</th><th class="r">Return</th></tr>{pos_rows}</table></div>
 <h2>Buy and exit decisions</h2><p class="sub">{_e(review_note)}</p><div class="card"><table><tr><th>Date</th><th>Ticker</th><th>Action</th><th>Outcome</th><th class="r">Allocation</th><th class="r">Confidence</th><th>Thesis</th></tr>{dec_html}</table></div>
-<h2>Today's watchlist (from news traction)</h2><div class="card"><table><tr><th class="r">#</th><th>Ticker</th><th>Sector</th><th class="r">Attention</th><th class="r">Items</th><th class="r">Sentiment</th><th class="r">Shift</th><th class="r">Graham</th><th class="r">MoS</th><th class="r">Buffett</th><th>Marks</th><th>Last review</th><th class="r">Conf.</th></tr>{watch_rows}</table></div>
+<h2>Today's watchlist (from news traction)</h2><p class="sub">{_e(watch_note)}</p><div class="card"><table><tr><th class="r">#</th><th class="r">Move</th><th>Ticker</th><th>Sector</th><th class="r">Attention</th><th class="r">Items</th><th class="r">Sentiment</th><th class="r">Shift</th><th class="r">Graham</th><th class="r">MoS</th><th class="r">Buffett</th><th>Marks</th><th>Last review</th><th class="r">Conf.</th></tr>{watch_rows}</table></div>
 <h2>Which inputs predict returns vs SPY</h2><p class="sub">Rank correlation between each input and later return against SPY, across the watchlist. Near zero means no predictive value; it takes months to mean anything.</p>
 <div class="card"><table><tr><th>Input</th>{ic_head}</tr>{ic_rows}</table></div>
 <h2>Sector ETFs over the same period</h2><div class="card"><table><tr><th>ETF</th><th>Sector</th><th class="r">Return</th></tr>{etf_rows}</table></div>

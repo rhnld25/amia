@@ -23,6 +23,8 @@ def main() -> None:
     d = sub.add_parser("daily", help="run the daily pipeline")
     d.add_argument("--date", default=None)
     d.add_argument("--facts-limit", type=int, default=200)
+    i = sub.add_parser("intraday", help="refresh news and the live watchlist; no decisions or trades")
+    i.add_argument("--date", default=None)
     b = sub.add_parser("backfill", help="load macro history and score the last week of news to seed the watchlist")
     b.add_argument("--days", type=int, default=7)
     m = sub.add_parser("monthly", help="write the monthly evaluation report")
@@ -53,6 +55,8 @@ def main() -> None:
         print("schema ready")
     elif args.cmd == "daily":
         print(json.dumps(pipe.daily(args.date or _today_ny(), args.facts_limit), default=str, indent=2))
+    elif args.cmd == "intraday":
+        print(json.dumps(pipe.intraday(args.date or _today_ny()), default=str, indent=2))
     elif args.cmd == "backfill":
         as_of = _today_ny()
         pipe.ticker_map(as_of)

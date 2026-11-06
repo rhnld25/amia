@@ -314,7 +314,9 @@ class Pipeline:
         self.db.upsert("text_scores", rows, ["item_id", "score_pass"])
 
     # ------------------------------------------------------------ discovery
-    def discover(self, as_of: str, held: set[str], tmap: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    def rank_watchlist(self, as_of: str, held: set[str], tmap: dict[str, dict[str, Any]], prices_through: str) -> list[dict[str, Any]]:
+        """The watchlist from news scored so far. Prices are only fetched through `prices_through`, so an
+        intraday refresh never stores a half-finished daily bar."""
         items = self.db.query(
             "SELECT symbols, published_at, novelty, sentiment, relevance FROM text_scores "
             "WHERE score_pass = 'primary' AND published_at >= :a AND published_at <= :b",
@@ -325,13 +327,31 @@ class Pipeline:
         candidates = sorted((s for s, r in table.items() if r["attention"] >= DISCOVERY["min_attention"]), key=lambda s: -table[s]["attention"])
         candidates = candidates[: 2 * DISCOVERY["watchlist_size"]]
         profiles = self.ensure_profiles(candidates + sorted(held), tmap, as_of)
-        self.update_prices(candidates, as_of)
+        self.update_prices(candidates, prices_through)
         priced = {r["symbol"] for r in self.db.query("SELECT DISTINCT symbol FROM prices WHERE date >= :d", {"d": _minus(as_of, 7)})}
         unpriced = [s for s in candidates if s not in priced]
         if unpriced:
             self.notes.append(f"no price data, left off the watchlist: {', '.join(unpriced[:15])}")
         company = {s: p["cik"] for s, p in profiles.items() if p.get("cik")}
-        wl = build_watchlist(table, held, eligible=priced, company=company)
+        return build_watchlist(table, held, eligible=priced, company=company, dollar_volume=self._dollar_volume(candidates, as_of))
+
+    def _dollar_volume(self, symbols: list[str], as_of: str) -> dict[str, float]:
+        """Average daily dollar volume over the last ~20 trading days (volume is stored from Nov 2026 on)."""
+        if not symbols:
+            return {}
+        clause, params = _in("s", sorted(set(symbols)))
+        return {
+            r["symbol"]: float(r["dv"])
+            for r in self.db.query(
+                f"SELECT symbol, AVG(close * volume) AS dv FROM prices WHERE symbol IN {clause} AND date > :a AND date <= :d "
+                "AND volume IS NOT NULL GROUP BY symbol",
+                {**params, "a": _minus(as_of, 30), "d": as_of},
+            )
+            if r["dv"] is not None
+        }
+
+    def discover(self, as_of: str, held: set[str], tmap: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+        wl = self.rank_watchlist(as_of, held, tmap, as_of)
         self.db.execute("DELETE FROM watchlist WHERE date = :d", {"d": as_of})
         self.db.upsert(
             "watchlist",
@@ -342,6 +362,37 @@ class Pipeline:
         entered = [w["symbol"] for w in wl if w["symbol"] not in prev]
         self.notes.append(f"watchlist: {len(wl)} names, {len(entered)} new ({', '.join(entered[:10])})")
         return wl
+
+    # ------------------------------------------------------------- intraday
+    def intraday(self, as_of: str) -> dict[str, Any]:
+        """News and watchlist refresh during the day. No decisions, no trades and no change to the official
+        watchlist: the evening run still decides on the list as of the close. The result is kept in kv for
+        the dashboard."""
+        run_id = uuid.uuid4().hex[:12]
+        self.notes = []
+        self.db.upsert("runs", [{"run_id": run_id, "kind": "intraday", "as_of": as_of, "started": _now(), "finished": None, "status": "running", "notes": None}], ["run_id"])
+        status = "ok"
+        try:
+            held = set(positions(self.db))
+            last = self.db.scalar("SELECT MAX(date) FROM watchlist WHERE date <= :d", {"d": as_of})
+            official = [r["symbol"] for r in self.db.query("SELECT symbol FROM watchlist WHERE date = :d", {"d": last})] if last else []
+            tmap = self.ticker_map(as_of)
+            self.ingest_news(as_of, True, held | set(official))
+            self.score_text()
+            wl = self.rank_watchlist(as_of, held, tmap, _minus(as_of, 1))
+            entered = [w["symbol"] for w in wl if w["rank"] and w["symbol"] not in official]
+            self.db.set_kv("watchlist:live", {"updated": _now(), "as_of": as_of, "since": last, "rows": wl})
+            self.notes.append(f"live watchlist: {len(wl)} names, {len(entered)} new since the {last or 'first'} close ({', '.join(entered[:10])})")
+            return {"status": "ok", "watchlist": len(wl), "entered": entered}
+        except Exception as e:
+            status = "error"
+            self.alerts.alert("Intraday refresh failed", f"{as_of}: {type(e).__name__}: {e}")
+            raise
+        finally:
+            self.db.execute(
+                "UPDATE runs SET finished = :f, status = :s, notes = :n WHERE run_id = :r",
+                {"f": _now(), "s": status, "n": json.dumps(self.notes + [f"alert: {a}" for a in self.alerts.sent]), "r": run_id},
+            )
 
     # ---------------------------------------------------------------- daily
     def daily(self, as_of: str, facts_limit: int = 200, live_clock: bool = True) -> dict[str, Any]:

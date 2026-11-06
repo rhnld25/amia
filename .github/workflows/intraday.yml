@@ -1,0 +1,60 @@
+name: intraday
+
+# Every 15 minutes from 12:00 to 21:45 UTC on weekdays: 7 am to 4:45 pm New York in winter, 8 am to 5:45 pm in
+# summer. Scores new news and republishes the watchlist; no decisions or trades (the evening daily run does those).
+# GitHub may start scheduled runs late or skip one when busy; the next run catches up on all news since the last.
+on:
+  schedule:
+    - cron: "*/15 12-21 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: amia-db
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+      ALPACA_API_KEY_ID: ${{ secrets.ALPACA_API_KEY_ID }}
+      ALPACA_API_SECRET_KEY: ${{ secrets.ALPACA_API_SECRET_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      AMIA_LLM_MONTHLY_CAP_USD: ${{ vars.AMIA_LLM_MONTHLY_CAP_USD || '10' }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install ".[postgres]"
+      - name: Refresh news and the live watchlist
+        run: python -m amia intraday
+      - name: Build dashboard
+        if: always()
+        run: python -m amia build-site --out site
+      - uses: actions/upload-pages-artifact@v3
+        if: always()
+        with:
+          path: site
+
+  deploy:
+    needs: run
+    if: always() && needs.run.result != 'cancelled'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
