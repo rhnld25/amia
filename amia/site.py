@@ -55,6 +55,7 @@ font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
 h1{font-size:24px;margin:0 0 4px}h2{font-size:17px;margin:32px 0 12px}
 .sub{color:var(--text-secondary);margin:0 0 20px;font-size:14px}
+.updated{margin:0 0 8px;font-size:14px;font-weight:600;font-variant-numeric:tabular-nums;color:var(--text-primary)}
 .tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
 .tile{background:var(--surface-1);border:1px solid var(--border);border-radius:10px;padding:12px 14px}
 .tile .k{color:var(--text-secondary);font-size:12px}.tile .v{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
@@ -332,6 +333,7 @@ def build_site(db: DB, out_dir: str) -> None:
     page = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AMIA Paper Portfolio</title><style>{CSS}</style></head><body><main>
 <h1>AMIA paper portfolio</h1>
+<p class="updated">Last updated {datetime.now(ZoneInfo("America/New_York")):%a %b %-d, %-I:%M %p} ET</p>
 <p class="sub">Framework {_e(FRAMEWORK_VERSION)} · data through {_e(last_date or '–')} · watchlist from news traction · decisions by Qwen (via OpenRouter) within code-enforced risk limits · paper trading only, not investment advice.</p>
 <div class="tiles">{tiles_html}</div>
 <h2>Growth of 100</h2>
