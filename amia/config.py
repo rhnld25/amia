@@ -124,6 +124,13 @@ LEARNING = {
     "lesson_window_days": 365,
 }
 
+# Case studies: winning buys written up as study material (casestudies.py). A buy qualifies when it beats both
+# SPY and its sector ETF by `min_excess` at the checkpoint (63 trading days, about 3 months) or when it closes.
+CASE_STUDIES = {
+    "checkpoint_days": 63,
+    "min_excess": 0.05,
+}
+
 LENSES = ["llm_conf", "attention", "graham_mos", "buffett_passed", "marks_pendulum", "mom_12_1"]
 
 # OpenRouter price per million tokens (USD), checked 2026-11-04. Used for budget estimates; recorded spend

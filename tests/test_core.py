@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from amia import stats
@@ -291,3 +293,27 @@ def test_mda_extraction_skips_table_of_contents():
     out = extract_section(text, "10-K", 40000)
     assert out.startswith("Item 7. Management's Discussion and Analysis\nReal discussion.")
     assert "Item 7A" not in out
+
+
+def test_case_studies_pick_buys_that_beat_spy_and_sector(tmp_path):
+    from datetime import date, timedelta
+
+    from amia.casestudies import collect_cases
+    from amia.evaluation import ReturnPanel
+
+    db = DB(f"sqlite:///{tmp_path / 'c.db'}")
+    db.init_schema()
+    days = [(date(2026, 1, 1) + timedelta(days=i)).isoformat() for i in range(80)]
+    daily = {"SPY": 0.001, "XLK": 0.001, "WIN": 0.003, "SECT": 0.001, "MEH": 0.0015}  # WIN beats both; MEH by too little
+    db.upsert("prices", [{"symbol": s, "date": d, "open": 1, "close": 1, "ret": r} for s, r in daily.items() for d in days], ["symbol", "date"])
+
+    def buy(sym):
+        rec = {"ticker": sym, "sector": "Information Technology", "thesis": [], "target_allocation": 0.03, "confidence": 0.7}
+        return {"decision_id": f"{days[0]}-{sym}", "date": days[0], "symbol": sym, "action": "ACCUMULATE", "executed": 1, "record": json.dumps(rec)}
+
+    db.upsert("decisions", [buy("WIN"), buy("MEH")], ["decision_id"])
+    panel = ReturnPanel(db, days[0])
+    assert collect_cases(db, panel, days[40], {"Information Technology": "XLK"}) == []  # checkpoint not reached
+    cases = collect_cases(db, panel, days[-1], {"Information Technology": "XLK"})
+    assert [c["id"] for c in cases] == [f"3m:{days[0]}-WIN"]
+    assert cases[0]["outcome"]["excess_vs_sector_etf"] >= 0.05 and cases[0]["outcome"]["sector_etf"] == "XLK"

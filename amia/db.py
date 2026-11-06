@@ -86,6 +86,10 @@ CREATE TABLE IF NOT EXISTS ic (
 CREATE TABLE IF NOT EXISTS postmortems (
     id TEXT PRIMARY KEY, month TEXT, case_type TEXT, symbol TEXT, sector TEXT, decision_id TEXT,
     cause TEXT, lens TEXT, adjustment TEXT, explanation TEXT, lesson TEXT, excess_ret {REAL}, record TEXT, created_at TEXT);
+CREATE TABLE IF NOT EXISTS case_studies (
+    id TEXT PRIMARY KEY, checkpoint TEXT, symbol TEXT, sector TEXT, decision_id TEXT, decided TEXT,
+    checkpoint_date TEXT, verdict TEXT, title TEXT, excess_spy {REAL}, excess_sector {REAL}, grounded INTEGER,
+    record TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS lessons (
     lesson_id TEXT PRIMARY KEY, sector TEXT, lens TEXT, adjustment TEXT, guidance TEXT, evidence TEXT,
     n_cases INTEGER, status TEXT, created_month TEXT);

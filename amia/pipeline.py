@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from . import evaluation, learning, retention, risk, stats
+from . import casestudies, evaluation, learning, retention, risk, stats
 from .alerts import Alerter
 from .config import (
     BENCHMARKS,
@@ -928,6 +928,7 @@ class Pipeline:
         evaluation.update_ic(self.db, panel)
         evaluation.tag_closed_positions(self.db, panel, SECTOR_ETFS)
         learning.run_postmortems(self.db, self.llm, panel, as_of, SECTOR_ETFS, self.notes)
+        casestudies.write_case_studies(self.db, self.llm, panel, as_of, SECTOR_ETFS, self.notes)
         new_lessons = learning.update_lessons(self.db, as_of)
         m = metrics(self.db)
         ic = evaluation.ic_summary(self.db)
@@ -936,6 +937,7 @@ class Pipeline:
         ground = evaluation.grounding_failure_rate(self.db)
         pms = self.db.query("SELECT symbol, case_type, cause, lens, adjustment, explanation FROM postmortems WHERE month = :m", {"m": as_of[:7]})
         lessons = self.db.query("SELECT * FROM lessons WHERE status = 'active' ORDER BY created_month")
+        studies = self.db.query("SELECT symbol, checkpoint, verdict, title, excess_spy, excess_sector FROM case_studies WHERE created_at >= :m", {"m": as_of[:7]})
 
         def ic_line(lens: str) -> str:
             parts = [f"{h}d {v['mean_ic']:+.3f} (t {v['t_stat_overlap_adj']:.1f}, {v['days']} days)" if v["mean_ic"] is not None else f"{h}d – ({v['days']} days)" for h, v in ic[lens].items()]
@@ -959,6 +961,9 @@ class Pipeline:
             "",
             f"## Post-mortems this month ({len(pms)})",
             *(f"- {p['symbol']} ({p['case_type']}): {p['cause']}; {p['lens']} {p['adjustment']}. {p['explanation']}" for p in pms),
+            "",
+            f"## Case studies this month ({len(studies)})",
+            *(f"- {c['symbol']} ({c['checkpoint']}, {c['verdict']}): {c['title']}. Beat SPY by {c['excess_spy']:+.1%}, sector ETF by {c['excess_sector']:+.1%}." for c in studies),
             "",
             f"## Lessons ({len(lessons)} active, {len(new_lessons)} new)",
             *(f"- [{lsn['sector']} | {lsn['lens']} {lsn['adjustment']}] {lsn['guidance']} ({lsn['n_cases']} cases)" for lsn in lessons),

@@ -27,7 +27,7 @@ Nobody runs it by hand. There's no server to maintain, and it never places real 
 | Interest rates, credit spreads, yield curve | FRED (St. Louis Fed) | **$0** |
 | AI news scoring, about 1,500 items a day | Qwen 3.7 Flash via OpenRouter | **~$0.70** |
 | AI investment memos and decisions, up to 40 a day | Qwen 3.7 Plus via OpenRouter | **~$5** |
-| AI monthly post-mortems | Qwen 3.7 Plus via OpenRouter | **<$0.10** |
+| AI monthly post-mortems and case studies | Qwen 3.7 Plus via OpenRouter | **<$0.50** |
 | **Total** | | **≈ $6, with a hard $10 cap in code** |
 
 ### Cost per unit
@@ -101,6 +101,8 @@ Performance is measured forward only, on live paper results: alpha against SPY, 
 
 On the 1st of each month, Qwen 3.7 Plus writes a post-mortem for each closed or missed trade. A lesson that at least 3 post-mortems agree on becomes permanent guidance.
 
+It also writes **case studies** of winning buys: any buy that beat both SPY and its sector ETF by 5 points, three months on or when it closed. Each one is built from the saved snapshot of what the model saw on the day. It sets out what the signals said, what happened, and which signals did the work. It also gives an honest verdict: **earned** if the thesis played out, **lucky** if the stock rose for a reason the thesis never named. They're published on the dashboard as study material, with every number checked against the data.
+
 ## Local use
 
 ```bash
@@ -147,6 +149,7 @@ AMIA_MOCK=1 .venv/bin/python -m amia build-site
 | `amia/portfolio.py` | Fill model, daily marking, metrics against SPY and T-bills |
 | `amia/evaluation.py` | Per-input rank IC, Brier score, attribution tags |
 | `amia/learning.py` | Monthly post-mortems and permanent lessons |
+| `amia/casestudies.py` | Monthly case studies of winning buys, earned or lucky |
 | `amia/pipeline.py` | Daily orchestration |
 | `amia/site.py` | Dashboard |
 

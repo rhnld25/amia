@@ -74,6 +74,10 @@ padding:8px 10px;font-size:12px;box-shadow:0 2px 8px rgba(0,0,0,.12);display:non
 ul.thesis{margin:4px 0 0;padding-left:18px;color:var(--text-secondary)}
 details summary{cursor:pointer;color:var(--text-secondary)}
 pre{white-space:pre-wrap;font-size:12px;color:var(--text-secondary)}
+a{color:var(--series-1)}
+main.study{max-width:760px}main.study p{max-width:68ch}
+table.facts th{text-align:left;color:var(--text-secondary);font-weight:500;white-space:normal;width:34%}table.facts td{white-space:normal}
+.takeaway{font-size:16px;border-left:3px solid var(--series-1);padding-left:12px}
 """
 
 CHART_JS = """
@@ -180,6 +184,53 @@ def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{**r, "name": None, "sector": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})} for r in rows]
 
 
+ROLE_LABEL = {"drove_result": "Drove the result", "supported": "Supported", "noise": "Noise", "misleading": "Misleading"}
+VERDICT_NOTE = {
+    "earned": "Earned: the signals the thesis relied on played out.",
+    "lucky": "Lucky: it made money for a reason the thesis didn't name. Worth reading as what not to copy.",
+}
+
+
+def _study_slug(study_id: str) -> str:
+    return study_id.replace(":", "-")
+
+
+def _study_page(row: dict[str, Any]) -> str:
+    rec = json.loads(row["record"])
+    cs, case = rec["study"], rec["case"]
+    o, dec = case["outcome"], case.get("decision") or {}
+    facts = [
+        ("Ticker", f"{row['symbol']} · {row['sector']}"),
+        ("Bought", f"{o['decided']} at {_pct(dec.get('target_allocation'), -1)} of the portfolio, confidence {_num(dec.get('confidence'))}"),
+        ("Checkpoint", f"{o['checkpoint_date']} ({'position closed' if row['checkpoint'] == 'closed' else 'three months on'}), {o['trading_days_held']} trading days"),
+        ("Return", _pct(o["return"])),
+        ("vs SPY", _pct(o["excess_vs_spy"])),
+        (f"vs sector ETF ({o.get('sector_etf') or '–'})", _pct(o["excess_vs_sector_etf"])),
+    ]
+    facts_html = "".join(f"<tr><th>{_e(k)}</th><td>{_e(v)}</td></tr>" for k, v in facts)
+    thesis = "".join(f"<li>{_e(b)}</li>" for b in dec.get("thesis", []))
+    signals = "".join(
+        f"<tr><td>{_e(x['signal'])}</td><td><span class='badge {'ok' if x['role'] == 'drove_result' else 'bad' if x['role'] == 'misleading' else ''}'>"
+        f"{_e(ROLE_LABEL.get(x['role'], x['role']))}</span></td><td>{_e(x['evidence'])}</td></tr>"
+        for x in cs["signals"]
+    )
+    verdict = cs["verdict"]
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{_e(cs['title'])} · AMIA case study</title><style>{CSS}</style></head><body><main class="study">
+<p class="sub"><a href="../index.html#case-studies">← AMIA case studies</a></p>
+<h1>{_e(cs['title'])}</h1>
+<p><span class="badge {'ok' if verdict == 'earned' else 'bad'}">{_e(verdict.title())}</span> <span class="sub">{_e(VERDICT_NOTE[verdict])}</span></p>
+<div class="card"><table class="facts">{facts_html}</table></div>
+<h2>The setup</h2><p>{_e(cs['setup'])}</p>
+<h2>The call</h2><p>{_e(cs['call'])}</p><p class="sub">The thesis as written on the day:</p><ul class="thesis">{thesis}</ul>
+<h2>What happened</h2><p>{_e(cs['what_happened'])}</p>
+<h2>Which signals mattered</h2><div class="card"><table><tr><th>Signal</th><th>Role</th><th>Evidence</th></tr>{signals}</table></div>
+<h2>Takeaway</h2><p class="takeaway">{_e(cs['takeaway'])}</p>
+<details><summary>full decision record</summary><pre>{_e(json.dumps(dec, indent=1))}</pre></details>
+<p class="sub">Written by Qwen (via OpenRouter) from the decision's saved inputs and what followed; every number is checked against that data. Paper trading only, not investment advice.</p>
+</main></body></html>"""
+
+
 def build_site(db: DB, out_dir: str) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
@@ -213,6 +264,20 @@ def build_site(db: DB, out_dir: str) -> None:
         watch_note = f"As of the {last_date or '–'} close. During market hours it refreshes every 15 minutes."
     # intraday refreshes run every 15 minutes; the run log keeps the daily and monthly runs readable
     runs = db.query("SELECT * FROM runs WHERE kind <> 'intraday' ORDER BY started DESC LIMIT 10")
+    studies = db.query("SELECT * FROM case_studies WHERE grounded = 1 ORDER BY checkpoint_date DESC, id")
+    (out / "studies").mkdir(exist_ok=True)
+    for st in studies:
+        (out / "studies" / f"{_study_slug(st['id'])}.html").write_text(_study_page(st))
+    study_rows = "".join(
+        f"<tr><td>{_e(st['checkpoint_date'])}</td><td><b>{_e(st['symbol'])}</b><div class='sub'>{_e(st['sector'])}</div></td>"
+        f"<td><a href='studies/{_study_slug(st['id'])}.html'>{_e(st['title'])}</a></td>"
+        f"<td><span class='badge {'ok' if st['verdict'] == 'earned' else 'bad'}'>{_e(st['verdict'].title())}</span></td>"
+        f"<td class='r'>{_pct(st['excess_spy'])}</td><td class='r'>{_pct(st['excess_sector'])}</td></tr>"
+        for st in studies
+    ) or (
+        "<tr><td colspan='6' class='sub'>The first case studies appear once buys reach their three-month checkpoint "
+        "having beaten both SPY and their sector ETF by 5 points.</td></tr>"
+    )
     closed = db.query("SELECT * FROM closed_positions ORDER BY closed_date DESC LIMIT 20")
     spend = db.query("SELECT SUBSTR(ts, 1, 7) AS month, SUM(usd) AS usd FROM llm_spend GROUP BY SUBSTR(ts, 1, 7) ORDER BY month DESC LIMIT 6")
     reports = db.query("SELECT key, value FROM kv WHERE key LIKE 'report:%' ORDER BY key DESC LIMIT 3")
@@ -342,6 +407,8 @@ def build_site(db: DB, out_dir: str) -> None:
 <script type="application/json" id="nav-data">{json.dumps(nav_data)}</script>
 <h2>Open positions</h2><div class="card"><table><tr><th>Ticker</th><th>Sector</th><th>Opened</th><th class="r">Entry</th><th class="r">Last</th><th class="r">Weight</th><th class="r">Return</th></tr>{pos_rows}</table></div>
 <h2>Buy and exit decisions</h2><p class="sub">{_e(review_note)}</p><div class="card"><table><tr><th>Date</th><th>Ticker</th><th>Action</th><th>Outcome</th><th class="r">Allocation</th><th class="r">Confidence</th><th>Thesis</th></tr>{dec_html}</table></div>
+<h2 id="case-studies">Case studies</h2><p class="sub">Winning buys written up as study material: what the signals said, what happened, and whether the thesis earned the result or got lucky. A buy qualifies when it beats both SPY and its sector ETF by 5 points, three months on or when it closes.</p>
+<div class="card"><table><tr><th>Checkpoint</th><th>Ticker</th><th>Study</th><th>Verdict</th><th class="r">vs SPY</th><th class="r">vs sector ETF</th></tr>{study_rows}</table></div>
 <h2>Today's watchlist (from news traction)</h2><p class="sub">{_e(watch_note)}</p><div class="card"><table><tr><th class="r">#</th><th class="r">Move</th><th>Ticker</th><th>Sector</th><th class="r">Attention</th><th class="r">Items</th><th class="r">Sentiment</th><th class="r">Shift</th><th class="r">Graham</th><th class="r">MoS</th><th class="r">Buffett</th><th>Marks</th><th>Last review</th><th class="r">Conf.</th></tr>{watch_rows}</table></div>
 <h2>Which inputs predict returns vs SPY</h2><p class="sub">Rank correlation between each input and later return against SPY, across the watchlist. Near zero means no predictive value; it takes months to mean anything.</p>
 <div class="card"><table><tr><th>Input</th>{ic_head}</tr>{ic_rows}</table></div>
