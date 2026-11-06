@@ -20,6 +20,7 @@ DISCOVERY = {
     "min_attention": 1.0,  # roughly one novel, relevant item, or several minor ones
     "max_symbols_per_article": 5,  # articles tagging more tickers are market roundups (noise)
     "max_news_per_run": 1500,  # cost bound on scoring
+    "intraday_facts_limit": 20,  # SEC financials fetched per 15-minute refresh, for names new to the watchlist
     "keywords": [
         "earnings", "guidance", "outlook", "forecast", "beat", "miss", "revenue", "profit", "loss", "margin",
         "acquire", "acquisition", "merger", "buyout", "takeover", "spin-off", "spinoff", "divest",

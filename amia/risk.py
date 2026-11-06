@@ -77,9 +77,16 @@ def required_confidence(sector: str, state: PortfolioState, regime: list[str]) -
 
 
 def check_buy(
-    symbol: str, sector: str, weight: float, sym_beta: float | None, state: PortfolioState, rets: dict[str, dict[str, float]]
+    symbol: str,
+    sector: str,
+    weight: float,
+    sym_beta: float | None,
+    state: PortfolioState,
+    rets: dict[str, dict[str, float]],
+    same_company: list[str] | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Hard limits. Returns (approved, details)."""
+    """Hard limits. Returns (approved, details). `same_company`: held share classes of the same company (same
+    SEC CIK). Buying a second class would double the position, so it fails the position limit."""
     d: dict[str, Any] = {}
     d["position_weight"] = weight
     d["sector_weight_after"] = round(state.sector_weight(sector) + weight, 4)
@@ -90,6 +97,9 @@ def check_buy(
     failures = []
     if weight > DECISION["max_position_weight"]:
         failures.append("position limit")
+    if same_company:
+        d["same_company_held"] = sorted(same_company)
+        failures.append(f"another share class of this company is held ({', '.join(sorted(same_company))})")
     if d["sector_weight_after"] > RISK["max_sector_weight"]:
         failures.append("sector limit")
     if sector == "Unknown" and d["sector_weight_after"] > RISK["max_unknown_sector_weight"]:

@@ -317,3 +317,12 @@ def test_case_studies_pick_buys_that_beat_spy_and_sector(tmp_path):
     cases = collect_cases(db, panel, days[-1], {"Information Technology": "XLK"})
     assert [c["id"] for c in cases] == [f"3m:{days[0]}-WIN"]
     assert cases[0]["outcome"]["excess_vs_sector_etf"] >= 0.05 and cases[0]["outcome"]["sector_etf"] == "XLK"
+
+
+def test_second_share_class_fails_the_position_limit():
+    from amia import risk
+
+    state = risk.PortfolioState(nav=100_000, weights={"GOOGL": 0.04}, sectors={"GOOGL": "Communication Services"})
+    ok, d = risk.check_buy("GOOG", "Communication Services", 0.03, 1.0, state, {}, same_company=["GOOGL"])
+    assert not ok and "another share class" in d["failures"][0]
+    assert risk.check_buy("META", "Communication Services", 0.03, 1.0, state, {})[0]

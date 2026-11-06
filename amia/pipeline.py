@@ -381,6 +381,7 @@ class Pipeline:
             self.score_text()
             wl = self.rank_watchlist(as_of, held, tmap, _minus(as_of, 1))
             entered = [w["symbol"] for w in wl if w["rank"] and w["symbol"] not in official]
+            self._intraday_frameworks(wl, tmap, as_of)
             self.db.set_kv("watchlist:live", {"updated": _now(), "as_of": as_of, "since": last, "rows": wl})
             self.notes.append(f"live watchlist: {len(wl)} names, {len(entered)} new since the {last or 'first'} close ({', '.join(entered[:10])})")
             return {"status": "ok", "watchlist": len(wl), "entered": entered}
@@ -393,6 +394,34 @@ class Pipeline:
                 "UPDATE runs SET finished = :f, status = :s, notes = :n WHERE run_id = :r",
                 {"f": _now(), "s": status, "n": json.dumps(self.notes + [f"alert: {a}" for a in self.alerts.sent]), "r": run_id},
             )
+
+    def _intraday_frameworks(self, wl: list[dict[str, Any]], tmap: dict[str, dict[str, Any]], as_of: str) -> None:
+        """Data on demand for names the news just brought in: SEC financials and recent filings are fetched now
+        (filings are scored in the next refresh), and Graham, Buffett and Marks are computed at the last close.
+        The numbers ride along on the live watchlist rows; nothing is written to the features table."""
+        last_close = self.db.scalar("SELECT MAX(date) FROM prices WHERE symbol = 'SPY' AND date < :d", {"d": as_of})
+        if not last_close:
+            return
+        profiles = self.ensure_profiles([w["symbol"] for w in wl], tmap, as_of)
+        new_entries = [p for p in profiles.values() if p["cik"] and not p["filings_checked"]]
+        if new_entries:
+            self.scan_filings(new_entries, as_of)
+            self.ingest_filings(limit=20)
+        fetched = self.refresh_facts([p["cik"] for p in profiles.values() if p["cik"]], DISCOVERY["intraday_facts_limit"])
+        today = {r["symbol"]: r for r in self.db.query("SELECT * FROM prices WHERE date = :d", {"d": last_close})}
+        ctx, _ = self.compute_features(wl, profiles, last_close, today, self.macro_until(last_close), store=False)
+        for w in wl:
+            c = ctx.get(w["symbol"])
+            if c:
+                g, b = c["graham"], c["buffett"]
+                w.update(
+                    graham_passed=g.criteria_passed if g else None,
+                    graham_mos=g.mos_band_low if g else None,
+                    buffett_passed=b.criteria_passed if b else None,
+                    marks_pendulum=c["pendulum"]["score"],
+                    price=c["price"],
+                )
+        self.notes.append(f"data on demand: {len(new_entries)} new companies, {fetched} financials fetched")
 
     # ---------------------------------------------------------------- daily
     def daily(self, as_of: str, facts_limit: int = 200, live_clock: bool = True) -> dict[str, Any]:
@@ -499,8 +528,11 @@ class Pipeline:
                 out[r["symbol"]][r["date"]] = r["ret"]
         return out
 
-    def compute_features(self, wl, profiles, as_of: str, today, macro) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-        """Component 2 math for every watchlist name: Graham, Buffett, Marks, momentum, volatility, beta."""
+    def compute_features(self, wl, profiles, as_of: str, today, macro, store: bool = True) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+        """Component 2 math for every watchlist name: Graham, Buffett, Marks, momentum, volatility, beta.
+
+        `store=False` (intraday) computes without writing: features rows are the evaluation's daily cross-section,
+        and names picked from today's news must not join yesterday's."""
         aaa_series = macro.get("DAAA") or macro.get("AAA") or []
         aaa = aaa_series[-1][1] if aaa_series else None
         t10 = (macro.get("DGS10") or [(None, None)])[-1][1]
@@ -517,11 +549,12 @@ class Pipeline:
             r3 = marks.price_stats(series(etf))["ret_3m"]
             sector_rel[sector] = (etf, r3 - spy_3m if r3 is not None and spy_3m is not None else None)
         market["sector_etf_ret_3m_vs_spy"] = {etf: _r(v) for etf, v in sector_rel.values()}
-        self.db.upsert(
-            "market_state",
-            [{"date": as_of, "regime_flags": len(regime), "temperature_score": market["temperature_score"], "record": json.dumps(_r(market), default=str)}],
-            ["date"],
-        )
+        if store:
+            self.db.upsert(
+                "market_state",
+                [{"date": as_of, "regime_flags": len(regime), "temperature_score": market["temperature_score"], "record": json.dumps(_r(market), default=str)}],
+                ["date"],
+            )
 
         ranked_att = sorted(w["attention"] for w in wl if w["rank"])
         top_q = ranked_att[int(len(ranked_att) * 0.75)] if ranked_att else float("inf")
@@ -587,7 +620,8 @@ class Pipeline:
                     "llm_action": None,
                 }
             )
-        self.db.upsert("features", rows, ["date", "symbol"])
+        if store:
+            self.db.upsert("features", rows, ["date", "symbol"])
         self.notes.append(f"framework math for {len(rows)} names ({sum(1 for c in ctx.values() if c['graham'])} with SEC fundamentals)")
         return ctx, market
 
@@ -729,6 +763,18 @@ class Pipeline:
         )
         regime = market["regime_flags"]
 
+        # share classes of one company (same SEC CIK) count as one position
+        company = {r["symbol"]: r["cik"] for r in self.db.query("SELECT symbol, cik FROM symbols WHERE cik IS NOT NULL")}
+
+        def siblings(s: str) -> list[str]:
+            return [h for h in state.weights if h != s and company.get(s) and company.get(h) == company.get(s)]
+
+        consolidated = self._consolidate_share_classes(as_of, held, company, pending)
+        second_class = [s for s in ctx if s not in held and siblings(s)]
+        if second_class:
+            self.notes.append(f"another share class already held, not reviewed: {', '.join(second_class)}")
+        excluded = excluded | set(consolidated) | set(second_class)
+
         order = [s for s in ctx if s in held] + [s for s in ctx if s not in held]
         to_review = [s for s in order if s not in excluded and s not in pending and self._needs_review(s, ctx[s], as_of)]
         to_review = to_review[: DECISION["max_reviews_per_day"]]
@@ -778,7 +824,7 @@ class Pipeline:
                 elif buys >= DECISION["max_new_positions_per_day"]:
                     rv["outcome"] = "SKIP_DAILY_LIMIT"
                 else:
-                    ok, details = risk.check_buy(s, sector, a["target_allocation"], risk.beta(rets.get(s, {}), spy), state, rets)
+                    ok, details = risk.check_buy(s, sector, a["target_allocation"], risk.beta(rets.get(s, {}), spy), state, rets, siblings(s))
                     details["required_confidence"], details["reasons"] = req, why
                     rv["risk"] = details
                     if ok:
@@ -791,7 +837,64 @@ class Pipeline:
                         rv["outcome"] = "SKIP_RISK"
             else:
                 rv["outcome"] = "NO_TRADE"
-        return self._record_decisions(as_of, reviews, market)
+        return [f"EXIT {s} (EXECUTED, share-class consolidation)" for s in consolidated] + self._record_decisions(as_of, reviews, market)
+
+    def _consolidate_share_classes(self, as_of: str, held: dict[str, Any], company: dict[str, str], pending: set[str]) -> list[str]:
+        """When two share classes of one company are held, sell all but the most traded one (by dollar volume,
+        then by position size). A code decision, recorded like any other, with no model call. Returns the sold symbols."""
+        groups: dict[str, list[str]] = defaultdict(list)
+        for s in held:
+            if company.get(s) and s not in pending:
+                groups[company[s]].append(s)
+        dv = self._dollar_volume([s for g in groups.values() if len(g) > 1 for s in g], as_of)
+        sold, out, decision_rows, order_rows = [], [], [], []
+        for group in groups.values():
+            if len(group) < 2:
+                continue
+            keep = max(group, key=lambda s: (dv.get(s) or 0.0, held[s]["value"], s))
+            for s in sorted(set(group) - {keep}):
+                decision_id = f"{as_of}-{s}"
+                why = (
+                    f"{s} and {keep} are share classes of the same company, so they count as one position. "
+                    f"Keeping {keep}, the more actively traded class, and selling {s}."
+                )
+                record = {
+                    "decision_id": decision_id,
+                    "as_of": f"{as_of}T21:00:00Z",
+                    "ticker": s,
+                    "sector": held[s]["sector"],
+                    "held": True,
+                    "action": "EXIT",
+                    "outcome": "EXECUTED",
+                    "target_allocation": 0.0,
+                    "confidence": None,
+                    "required_confidence": None,
+                    "thesis": [why],
+                    "framework_views": {},
+                    "decided_by": "code: share-class consolidation",
+                    "kept_class": keep,
+                    "dollar_volume": {k: dv.get(k) for k in group},
+                }
+                decision_rows.append(
+                    {
+                        "decision_id": decision_id, "as_of": record["as_of"], "date": as_of, "symbol": s, "action": "EXIT",
+                        "target_weight": 0.0, "confidence": None, "record": json.dumps(record, default=str), "snapshot_hash": None,
+                        "resolve_on": None, "thesis_ok": 1, "executed": 1,
+                    }
+                )
+                order_rows.append(
+                    {
+                        "order_id": decision_id, "decision_id": decision_id, "symbol": s, "side": "SELL", "target_weight": 0.0,
+                        "created_date": as_of, "status": "pending", "fill_date": None, "fill_price": None, "amount": None,
+                    }
+                )
+                sold.append(s)
+                out.append(f"EXIT {s} (EXECUTED, share-class consolidation; keeping {keep})")
+        if decision_rows:
+            self.db.upsert("decisions", decision_rows, ["decision_id"], update=False)
+            self.db.upsert("orders", order_rows, ["order_id"], update=False)
+            self.notes.append("share-class consolidation: " + "; ".join(out))
+        return sold
 
     def _record_decisions(self, as_of: str, reviews: list[dict[str, Any]], market: dict[str, Any]) -> list[str]:
         if not reviews:

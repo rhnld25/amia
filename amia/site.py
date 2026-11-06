@@ -180,8 +180,14 @@ def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             names,
         )
     }
-    blank = dict.fromkeys(("graham_passed", "graham_mos", "buffett_passed", "marks_pendulum", "llm_action", "llm_conf", "price"))
-    return [{**r, "name": None, "sector": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})} for r in rows]
+    framework = ("graham_passed", "graham_mos", "buffett_passed", "marks_pendulum", "price")
+    blank = dict.fromkeys(framework + ("llm_action", "llm_conf"))
+    out = []
+    for r in rows:
+        row = {**r, "name": None, "sector": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})}
+        row.update({k: r[k] for k in framework if r.get(k) is not None})  # computed in the refresh, at the last close
+        out.append(row)
+    return out
 
 
 ROLE_LABEL = {"drove_result": "Drove the result", "supported": "Supported", "noise": "Noise", "misleading": "Misleading"}

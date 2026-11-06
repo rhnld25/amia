@@ -82,7 +82,7 @@ No single rule decides whether to buy. The three frameworks are inputs, not gate
 The model weighs all of them and returns an action, an allocation, a calibrated confidence, a 3-point thesis, and a view from each of Graham, Buffett and Marks. Then code takes over:
 - **Grounding:** every number in the thesis must appear in the data the model was given. A made-up figure blocks the buy.
 - **Confidence bar:** the model must be at least 60% confident of beating SPY over six months, plus 5 points for each risk flag.
-- **Hard limits:** 5% per position, 25% per sector, a portfolio beta cap, a correlation cap, and at most 3 new buys a day.
+- **Hard limits:** 5% per position (share classes like GOOG and GOOGL count as one company: only the more actively traded class is considered, and a second class is never bought), 25% per sector, a portfolio beta cap, a correlation cap, and at most 3 new buys a day.
 - **Snapshots:** everything the model saw is saved with each decision, under a content hash.
 
 Performance is measured forward only, on live paper results: alpha against SPY, each position against its sector ETF, and cash against T-bills. The dashboard also tracks which inputs predict returns (rank IC) and how well calibrated the model's confidence is (Brier score).
@@ -98,6 +98,8 @@ Performance is measured forward only, on live paper results: alpha against SPY, 
 7. **Code checks.** It checks the answer's format, number grounding, the confidence bar and the risk limits.
 8. **Evaluation.** It updates the per-input IC and tags closed positions with likely causes.
 9. **Dashboard.** It rebuilds the static page and publishes it to GitHub Pages.
+
+**During market hours** a lighter refresh runs every 15 minutes. It scores the news since the last run, re-ranks the watchlist, and fetches data on demand for any company the news just brought in: SEC financials, recent filings, and Graham, Buffett and Marks numbers at the last close. The dashboard shows the live list with a refresh time and each name's move against the evening list. It makes no decisions and no trades; those stay with the evening run.
 
 On the 1st of each month, Qwen 3.7 Plus writes a post-mortem for each closed or missed trade. A lesson that at least 3 post-mortems agree on becomes permanent guidance.
 
@@ -127,7 +129,7 @@ Render the dashboard to `./site`:
 AMIA_MOCK=1 .venv/bin/python -m amia build-site
 ```
 
-**Commands:** `daily [--date]`, `backfill [--days]`, `monthly`, `build-site`, `simulate` (mock only), `init-db`.
+**Commands:** `daily [--date]`, `intraday [--date]`, `backfill [--days]`, `monthly`, `build-site`, `simulate` (mock only), `init-db`.
 
 **Settings:**
 - Without `DATABASE_URL`, the database is a local SQLite file, `amia_local.db`.
