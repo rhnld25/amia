@@ -10,7 +10,7 @@ import os
 import subprocess
 from dataclasses import dataclass, field
 
-FRAMEWORK_VERSION = "quantamental@2.0.0"
+FRAMEWORK_VERSION = "quantamental@3.0.0"
 
 # Component 1: discovery. The watchlist comes from news traction, not a fixed index.
 DISCOVERY = {
@@ -72,9 +72,9 @@ FRAMEWORK = {
 
 # Component 4: decision matrix. The reasoning model decides; code enforces these limits around it.
 DECISION = {
-    "base_confidence": 0.60,  # required P(beat SPY over 6 months) for a new position
+    "base_confidence": 0.60,  # required P(beat its benchmark over the horizon) for a new long
     "confidence_step": 0.05,  # added per regime flag or crowded sector
-    "max_new_positions_per_day": 3,
+    "max_new_positions_per_day": 3,  # per portfolio, longs and shorts together
     "min_position_weight": 0.005,
     "max_position_weight": 0.05,
     "review_stale_days": 5,  # re-review a name at least this often while it stays on the watchlist
@@ -108,8 +108,8 @@ PORTFOLIO = {
 }
 
 EVALUATION = {
-    "horizons": [21, 126],
-    "decision_horizon": 126,
+    "horizons": [21, 63, 126],
+    "decision_horizon": 63,  # v3: one horizon for every portfolio (v2.2 decisions were judged at 126)
     "min_names_for_ic": 8,
 }
 
@@ -195,7 +195,7 @@ KNOWN_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "USO", "UNG", "FXI", "IB
 BENCHMARKS = ["SPY", *SECTOR_ETFS.values(), *sorted({e for e in INDUSTRY_ETFS.values() if e not in SECTOR_ETFS.values()})]
 
 # Universes and portfolios (AMIA_spec_v3_draft.md). A universe is a filter on the instrument catalog; a portfolio
-# trades one universe with one strategy and keeps its own book. Phase 1 runs only `core`, today's portfolio.
+# trades one universe with one strategy and keeps its own book. `started` None means from its first run.
 UNIVERSES = {
     "us_all": {"classes": ["us_equity"]},
     "chips": {"classes": ["us_equity", "adr"], "industries": ["Semiconductors"]},
@@ -207,7 +207,30 @@ UNIVERSES = {
 STRATEGIES = ["long_only", "long_short", "long_hedge", "long_short_hedge"]
 CORE = "core"
 PORTFOLIOS = {
-    CORE: {"name": "Core", "universe": "us_all", "strategy": "long_only", "hedge": None, "started": "2026-11-03"},
+    CORE: {"name": "Core", "short": "Core", "universe": "us_all", "strategy": "long_only", "hedge": None, "started": "2026-11-03"},
+    "core_ls": {"name": "Long/short", "short": "L/S", "universe": "us_all", "strategy": "long_short", "hedge": None, "started": None},
+    "core_hedged": {"name": "Long, market-hedged", "short": "Hedged", "universe": "us_all", "strategy": "long_hedge", "hedge": "market", "started": None},
+    "core_lsh": {"name": "Long/short, industry-hedged", "short": "L/S hedged", "universe": "us_all", "strategy": "long_short_hedge", "hedge": "industry", "started": None},
+}
+
+# Shorts (code-enforced). Losses on a short have no ceiling, so the bar is higher and the sizes smaller than for longs.
+SHORT = {
+    "max_p": 0.30,  # open a short only when P(beats benchmark) is at most this
+    "min_position_weight": 0.005,
+    "max_position_weight": 0.03,
+    "max_total_weight": 0.30,  # all shorts together, hedges excluded
+    "max_sector_weight": 0.15,
+    "min_price": 5.0,  # proxies for easy to borrow, since free data has no borrow rates
+    "min_market_cap": 2e9,
+    "stop_loss": 0.25,  # cover when the price is this far above entry, whatever the view
+    "stop_cooldown_days": 30,  # no new short in that stock, in that portfolio, for this long after a stop
+    "borrow_fee_annual": 0.005,  # charged daily on every short, hedges included
+}
+
+# Hedges: a paper short of an ETF, rebalanced by code after each day's trades.
+HEDGE = {
+    "market_target_beta": 0.3,  # market mode: short SPY until the book's beta is at most this
+    "rebalance_threshold": 0.005,  # trade only when the hedge is this far (fraction of NAV) from target
 }
 
 

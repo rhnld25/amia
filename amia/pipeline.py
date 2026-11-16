@@ -13,7 +13,7 @@ import re
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from . import casestudies, evaluation, learning, retention, risk, stats
@@ -26,27 +26,37 @@ from .config import (
     EVALUATION,
     FRAMEWORK,
     FRAMEWORK_VERSION,
+    HEDGE,
     MACRO_SERIES,
     PORTFOLIO,
+    PORTFOLIOS,
     RISK,
     SECTOR_ETFS,
+    SHORT,
+    UNIVERSES,
     Settings,
 )
 from .data import Providers, get_providers
 from .data.sectors import asset_class_for, benchmark_for, industry_for, sector_for_sic
 from .db import DB
-from .decision import grounding_check, validate_decision
+from .decision import grounding_check, validate_position, validate_view
 from .discovery import attention_table, build_watchlist, keep_news
 from .frameworks import buffett, graham, marks
-from .llm import DECISION_PROMPT_VERSION, LLM, PRINCIPLES_VERSION, RUBRIC_VERSION, BudgetExceeded
-from .portfolio import metrics, positions, run_day, sync_portfolios
+from .llm import (
+    DECISION_PROMPT_VERSION,
+    LLM,
+    PRINCIPLES_VERSION,
+    RUBRIC_VERSION,
+    BudgetExceeded,
+)
+from .portfolio import held_symbols, metrics, positions, run_day, sync_portfolios
 from .snapshots import save_snapshot
 
 log = logging.getLogger(__name__)
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _minus(d: str, days: int) -> str:
@@ -256,7 +266,7 @@ class Pipeline:
     def ingest_news(self, as_of: str, live_clock: bool, always: set[str], since: str | None = None, cap: int | None = None) -> None:
         """All market news since the last run, filtered for high-impact keywords and away from roundups."""
         since = since or self.db.get_kv("news_since") or f"{_minus(as_of, 2)}T00:00:00Z"
-        end = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if live_clock else f"{as_of}T23:59:59Z"
+        end = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") if live_clock else f"{as_of}T23:59:59Z"
         try:
             news = self.p.news(since, end)
         except Exception as e:
@@ -406,7 +416,7 @@ class Pipeline:
         self.db.upsert("runs", [{"run_id": run_id, "kind": "intraday", "as_of": as_of, "started": _now(), "finished": None, "status": "running", "notes": None}], ["run_id"])
         status = "ok"
         try:
-            held = set(positions(self.db))
+            held = held_symbols(self.db)
             last = self.db.scalar("SELECT MAX(date) FROM watchlist WHERE date <= :d", {"d": as_of})
             official = [r["symbol"] for r in self.db.query("SELECT symbol FROM watchlist WHERE date = :d", {"d": last})] if last else []
             tmap = self.ticker_map(as_of)
@@ -435,7 +445,7 @@ class Pipeline:
         last_close = self.db.scalar("SELECT MAX(date) FROM prices WHERE symbol = 'SPY' AND date < :d", {"d": as_of})
         if not last_close:
             return
-        profiles = self.ensure_profiles([w["symbol"] for w in wl], tmap, as_of)
+        profiles = self.ensure_profiles([w["symbol"] for w in wl], tmap, as_of, classify_limit=len(wl))
         new_entries = [p for p in profiles.values() if p["cik"] and not p["filings_checked"]]
         if new_entries:
             self.scan_filings(new_entries, as_of)
@@ -477,7 +487,7 @@ class Pipeline:
             )
 
     def _daily(self, as_of: str, facts_limit: int, live_clock: bool) -> dict[str, Any]:
-        held = set(positions(self.db))
+        held = held_symbols(self.db)
         prev_wl = [r["symbol"] for r in self.db.query("SELECT symbol FROM watchlist WHERE date = (SELECT MAX(date) FROM watchlist WHERE date < :d)", {"d": as_of})]
         self.update_prices(BENCHMARKS + sorted(held) + prev_wl, as_of)
         if not self.db.scalar("SELECT 1 FROM prices WHERE symbol = 'SPY' AND date = :d", {"d": as_of}):
@@ -495,7 +505,7 @@ class Pipeline:
         self.score_text()
 
         wl = self.discover(as_of, held, tmap)
-        profiles = self.ensure_profiles([w["symbol"] for w in wl], tmap, as_of)
+        profiles = self.ensure_profiles([w["symbol"] for w in wl], tmap, as_of, classify_limit=len(wl))
         new_entries = [p for p in profiles.values() if p["cik"] and not p["filings_checked"]]
         self.scan_filings(new_entries, as_of)  # their filings are scored in the next run's batch
         self.refresh_facts([p["cik"] for p in profiles.values() if p["cik"]], facts_limit)
@@ -521,21 +531,24 @@ class Pipeline:
             self.alerts.alert("Data gate: AAA yield stale", f"Latest AAA observation: {aaa_series[-1] if aaa_series else 'none'}")
 
         ctx, market = self.compute_features(wl, profiles, as_of, today, macro)
-        size_of = {s: c["size"] for s, c in ctx.items()}
-        for s, p in positions(self.db).items():
+        size_of = {s: c["size"] for s, c in ctx.items()} | dict.fromkeys(BENCHMARKS, "large")
+        for s in held:
             size_of.setdefault(s, "small")
         rf = (macro.get("DTB3") or [(None, 0.0)])[-1][1]
         sector_of = {r["symbol"]: r["sector"] for r in self.db.query("SELECT symbol, sector FROM symbols")}
-        port = run_day(self.db, as_of, today, prev_close, size_of, sector_of, today.get("SPY", {}).get("ret"), rf, pid=CORE)
-        self.notes.extend(port.get("events", []))
+        port = {}
+        for pid in PORTFOLIOS:
+            port[pid] = run_day(self.db, as_of, today, prev_close, size_of, sector_of, today.get("SPY", {}).get("ret"), rf, pid=pid)
+            self.notes.extend(f"[{pid}] {e}" for e in port[pid].get("events", []))
 
         if halt:
             decisions = []
-        elif self.db.scalar("SELECT 1 FROM decisions WHERE date = :d LIMIT 1", {"d": as_of}):
+        elif self.db.get_kv(f"decided:{as_of}") or self.db.scalar("SELECT 1 FROM decisions WHERE date = :d LIMIT 1", {"d": as_of}):
             decisions = []
             self.notes.append("decisions already made for this date; not re-run")
         else:
             decisions = self.decide(as_of, wl, ctx, market, macro, set(jumps))
+            self.db.set_kv(f"decided:{as_of}", True)
         self._fill_llm_features(as_of)
 
         panel = evaluation.ReturnPanel(self.db, _minus(as_of, 420))
@@ -545,7 +558,7 @@ class Pipeline:
         pruned = retention.prune(self.db, as_of)
         if any(pruned.values()):
             self.notes.append("pruned: " + ", ".join(f"{n} {k}" for k, n in pruned.items() if n))
-        return {"status": "ok", "nav": port.get("nav"), "decisions": decisions, "watchlist": len(wl)}
+        return {"status": "ok", "nav": port[CORE].get("nav"), "navs": {pid: r.get("nav") for pid, r in port.items()}, "decisions": decisions, "watchlist": len(wl)}
 
     # -------------------------------------------------------------- features
     def _returns(self, symbols: list[str], as_of: str) -> dict[str, dict[str, float]]:
@@ -572,7 +585,7 @@ class Pipeline:
         symbols = [w["symbol"] for w in wl]
         rets = self._returns(symbols + BENCHMARKS, as_of)
         spy = rets.get("SPY", {})
-        series = lambda s: [rets.get(s, {})[d] for d in sorted(rets.get(s, {}))]  # noqa: E731
+        series = lambda s: [rets.get(s, {})[d] for d in sorted(rets.get(s, {}))]
         market = marks.market_cycle(macro, series("SPY"))
         regime = risk.regime_flags(macro)
         market["regime_flags"] = regime
@@ -582,6 +595,7 @@ class Pipeline:
             r3 = marks.price_stats(series(etf))["ret_3m"]
             sector_rel[sector] = (etf, r3 - spy_3m if r3 is not None and spy_3m is not None else None)
         market["sector_etf_ret_3m_vs_spy"] = {etf: _r(v) for etf, v in sector_rel.values()}
+        etf_3m = {etf: marks.price_stats(series(etf))["ret_3m"] for etf in BENCHMARKS}
         if store:
             self.db.upsert(
                 "market_state",
@@ -617,7 +631,13 @@ class Pipeline:
             beta = risk.beta(rets.get(s, {}), spy)
             mcap = b.market_cap if b else None
             etf, rel = sector_rel.get(prof["sector"], (None, None))
+            bench = prof.get("benchmark") or etf or "SPY"
+            b3 = etf_3m.get(bench)
             ctx[s] = {
+                "benchmark": bench,
+                "benchmark_rel_3m": b3 - spy_3m if b3 is not None and spy_3m is not None else None,
+                "stock_rel_3m": ps["ret_3m"] - b3 if b3 is not None and ps.get("ret_3m") is not None else None,
+                "market_cap": mcap,
                 "watch": w,
                 "profile": prof,
                 "pit": pit,
@@ -659,16 +679,19 @@ class Pipeline:
         return ctx, market
 
     def _fill_llm_features(self, as_of: str) -> None:
-        """Carry each name's latest review (up to the re-review interval) into today's features, for the IC."""
+        """Carry each name's latest view (up to the re-review interval) into today's features, for the IC: llm_conf is
+        the view's probability of beating its benchmark, llm_action is core's latest action on it."""
+        lo = _minus(as_of, DECISION["review_stale_days"] + 2)
         for f in self.db.query("SELECT symbol FROM features WHERE date = :d", {"d": as_of}):
-            r = self.db.query(
-                "SELECT action, confidence FROM decisions WHERE symbol = :s AND date <= :d AND date >= :a ORDER BY date DESC LIMIT 1",
-                {"s": f["symbol"], "d": as_of, "a": _minus(as_of, DECISION["review_stale_days"] + 2)},
+            v = self.db.scalar("SELECT p FROM views WHERE symbol = :s AND date <= :d AND date >= :a ORDER BY date DESC LIMIT 1", {"s": f["symbol"], "d": as_of, "a": lo})
+            act = self.db.scalar(
+                "SELECT action FROM decisions WHERE portfolio_id = :p AND symbol = :s AND date <= :d AND date >= :a ORDER BY date DESC LIMIT 1",
+                {"p": CORE, "s": f["symbol"], "d": as_of, "a": lo},
             )
-            if r:
+            if v is not None or act is not None:
                 self.db.execute(
                     "UPDATE features SET llm_conf = :c, llm_action = :a WHERE date = :d AND symbol = :s",
-                    {"c": r[0]["confidence"], "a": r[0]["action"], "d": as_of, "s": f["symbol"]},
+                    {"c": v, "a": act, "d": as_of, "s": f["symbol"]},
                 )
 
     # ------------------------------------------------------------ decisions
@@ -697,9 +720,10 @@ class Pipeline:
             )
         return out
 
-    def _dossier(self, s: str, c: dict[str, Any], as_of: str, state: risk.PortfolioState, regime: list[str], market: dict[str, Any], held: dict[str, Any] | None, buys_left: int) -> dict[str, Any]:
+    def _dossier(self, s: str, c: dict[str, Any], as_of: str, market: dict[str, Any]) -> dict[str, Any]:
+        """Everything the view model sees about one stock. It holds nothing about any portfolio: every portfolio
+        acts on the same view, and each one's own state goes to the position calls instead."""
         sector = c["profile"]["sector"]
-        req, reasons = risk.required_confidence(sector, state, regime)
         g, b, w, ps = c["graham"], c["buffett"], c["watch"], c["price_stats"]
         if g:
             gd = g.to_dict()
@@ -712,7 +736,9 @@ class Pipeline:
             "ticker": s,
             "name": c["profile"]["name"],
             "sector": sector,
-            "held": None,
+            "industry": c["profile"].get("industry"),
+            "benchmark": {"etf": c["benchmark"], "etf_ret_3m_vs_spy": c["benchmark_rel_3m"], "stock_ret_3m_vs_etf": c["stock_rel_3m"]},
+            "horizon_trading_days": EVALUATION["decision_horizon"],
             "price": {
                 "close": c["price"],
                 **ps,
@@ -734,28 +760,14 @@ class Pipeline:
             "buffett": buffett_view,
             "marks": {"stock": c["pendulum"], "market": {k: v for k, v in market.items() if k != "sector_etf_ret_3m_vs_spy"}},
             "news": self._news_for(s, as_of),
-            "portfolio": {
-                "nav": state.nav,
-                "cash_weight": 1 - sum(state.weights.values()),
-                "positions": len(state.weights),
-                "sector_weight": state.sector_weight(sector),
-                "portfolio_beta": state.beta(),
-                "new_positions_left_today": buys_left,
-            },
-            "risk_overlay": {"required_confidence": req, "reasons": reasons, "max_position_weight": DECISION["max_position_weight"]},
             "lessons": learning.lessons_for(self.db, sector),
         }
-        if held:
-            dossier["held"] = {
-                "weight": held["value"] / state.nav,
-                "entry_price": held["entry_price"],
-                "return_since_entry": held["value"] / held["cost"] - 1,
-                "days_held": (date.fromisoformat(as_of) - date.fromisoformat(held["opened_date"])).days,
-            }
         return _r(dossier)
 
     def _needs_review(self, s: str, c: dict[str, Any], as_of: str) -> bool:
-        last = self.db.query("SELECT date, record FROM decisions WHERE symbol = :s ORDER BY date DESC LIMIT 1", {"s": s})
+        """A stock gets a fresh view when it has none (every stock, once, at the v3 switch), when its last view is
+        stale, after a large move, or when new scored news or filings arrived."""
+        last = self.db.query("SELECT date, record FROM views WHERE symbol = :s ORDER BY date DESC LIMIT 1", {"s": s})
         if not last:
             return True
         if (date.fromisoformat(as_of) - date.fromisoformat(last[0]["date"])).days >= DECISION["review_stale_days"]:
@@ -769,171 +781,297 @@ class Pipeline:
         )
         return bool(newer)
 
-    def _ask(self, dossier: dict[str, Any], held: bool) -> dict[str, Any]:
-        """One reasoning call, with one retry if the answer is malformed or uses numbers not in the dossier."""
+    def _ask_view(self, dossier: dict[str, Any]) -> dict[str, Any]:
+        """One view call, with one retry if the answer is malformed or uses numbers not in the dossier."""
         feedback, answer = None, None
         for attempt in range(2):
-            raw = self.llm.decide(dossier, feedback)
-            answer, problems = validate_decision(raw, dossier["ticker"], held)
-            ok, bad = grounding_check(answer["thesis"], [dossier, answer["confidence"], answer["target_allocation"]])
+            raw = self.llm.view(dossier, feedback)
+            answer, problems = validate_view(raw, dossier["ticker"])
+            ok, bad = grounding_check(answer["thesis"] + answer["counter_case"], [dossier, answer["p_outperform"], answer["target_allocation"]])
             answer["checks"] = {"schema": "pass" if not problems else problems, "number_grounding": "pass" if ok else {"failed": bad}, "attempts": attempt + 1}
             if not problems and ok:
                 return answer
-            feedback = "; ".join(problems + ([f"thesis used numbers not in the dossier: {', '.join(bad)}"] if not ok else []))
+            feedback = "; ".join(problems + ([f"thesis or counter_case used numbers not in the dossier: {', '.join(bad)}"] if not ok else []))
         return answer  # type: ignore[return-value]
 
-    def decide(self, as_of, wl, ctx, market, macro, excluded: set[str]) -> list[str]:
-        held = positions(self.db)
-        nav = float(self.db.scalar("SELECT nav FROM nav WHERE portfolio_id = :p AND date = :d", {"p": CORE, "d": as_of}))
-        pending = {r["symbol"] for r in self.db.query("SELECT symbol FROM orders WHERE portfolio_id = :p AND status = 'pending'", {"p": CORE})}
-        rets = self._returns(list(held) + list(ctx) + ["SPY"], as_of)
+    def _ask_position(self, case: dict[str, Any], max_weight: float) -> dict[str, Any]:
+        """One position call (HOLD or close), with one retry on a malformed or ungrounded answer."""
+        feedback, answer = None, None
+        pos = case["position"]
+        for attempt in range(2):
+            raw = self.llm.position(case, feedback)
+            answer, problems = validate_position(raw, pos["ticker"], pos["side"], max_weight)
+            ok, bad = grounding_check(answer["reason"], [case, answer["target_allocation"]])
+            answer["checks"] = {"schema": "pass" if not problems else problems, "number_grounding": "pass" if ok else {"failed": bad}, "attempts": attempt + 1}
+            if not problems and ok:
+                return answer
+            feedback = "; ".join(problems + ([f"reason used numbers not in the input: {', '.join(bad)}"] if not ok else []))
+        return answer  # type: ignore[return-value]
+
+    @staticmethod
+    def _in_universe(profile: dict[str, Any], universe: str) -> bool:
+        u = UNIVERSES[universe]
+        if profile.get("asset_class") not in u.get("classes", []):
+            return False
+        if "sectors" in u and profile.get("sector") not in u["sectors"]:
+            return False
+        return not ("industries" in u and profile.get("industry") not in u["industries"])
+
+    def _state(self, pid: str, held: dict[str, Any], nav: float, rets: dict[str, dict[str, float]]) -> risk.PortfolioState:
         spy = rets.get("SPY", {})
-        state = risk.PortfolioState(
-            nav=nav,
-            weights={s: p["value"] / nav for s, p in held.items()},
-            sectors={s: p["sector"] or "Unknown" for s, p in held.items()},
-            betas={s: b for s in held if (b := risk.beta(rets.get(s, {}), spy)) is not None},
+        state = risk.PortfolioState(nav=nav, weights={}, sectors={s: p["sector"] or "Unknown" for s, p in held.items()})
+        for s, p in held.items():
+            w = p["value"] / nav
+            if p.get("kind") == "hedge":
+                state.hedges[s] = w
+            elif p.get("side") == "short":
+                state.shorts[s] = w
+            else:
+                state.weights[s] = w
+            if (b := risk.beta(rets.get(s, {}), spy)) is not None:
+                state.betas[s] = b
+        return state
+
+    def _position_case(self, pid: str, p: dict[str, Any], view: dict[str, Any], state: risk.PortfolioState, as_of: str, rets: dict[str, dict[str, float]]) -> dict[str, Any]:
+        cfg = PORTFOLIOS[pid]
+        side = p.get("side") or "long"
+        bench = view["benchmark"]
+        bench_since = 1.0
+        for d, r in rets.get(bench, {}).items():
+            if p["opened_date"] < d <= as_of:
+                bench_since *= 1 + r
+        return _r(
+            {
+                "position": {
+                    "ticker": p["symbol"],
+                    "side": side,
+                    "weight": p["value"] / state.nav,
+                    "entry_price": p["entry_price"],
+                    "last_close": p["last_close"],
+                    "return_since_entry": p["value"] / p["cost"] - 1 if side == "long" else 1 - p["value"] / p["cost"],
+                    "benchmark": bench,
+                    "benchmark_return_since_entry": bench_since - 1,
+                    "days_held": (date.fromisoformat(as_of) - date.fromisoformat(p["opened_date"])).days,
+                },
+                "portfolio": {
+                    "strategy": cfg["strategy"],
+                    "hedge": cfg.get("hedge"),
+                    "long_positions": len(state.weights),
+                    "short_positions": len(state.shorts),
+                    "long_weight": sum(state.weights.values()),
+                    "short_weight": sum(state.shorts.values()),
+                    "net_beta": state.beta(),
+                    "sector_weight": state.sector_weight(p["sector"] or "Unknown") if side == "long" else state.short_sector_weight(p["sector"] or "Unknown"),
+                },
+                "view": {k: view[k] for k in ("p_outperform", "benchmark", "target_allocation", "thesis", "counter_case", "key_risks", "framework_views")},
+            }
         )
+
+    def decide(self, as_of, wl, ctx, market, macro, excluded: set[str]) -> list[str]:
+        """v3: one view per stock, shared by every portfolio; then, per portfolio, a model call on each open
+        position with a fresh view, entries from the view by code within the portfolio's risk limits, and hedges."""
         regime = market["regime_flags"]
-
-        # share classes of one company (same SEC CIK) count as one position
         company = {r["symbol"]: r["cik"] for r in self.db.query("SELECT symbol, cik FROM symbols WHERE cik IS NOT NULL")}
+        held_by = {pid: positions(self.db, pid) for pid in PORTFOLIOS}
+        pending_by = {
+            pid: {r["symbol"] for r in self.db.query("SELECT symbol FROM orders WHERE portfolio_id = :p AND status = 'pending'", {"p": pid})}
+            for pid in PORTFOLIOS
+        }
+        held_any = {s for held in held_by.values() for s, p in held.items() if p.get("kind", "stock") == "stock"}
+        universe_of = {pid: {s for s in ctx if self._in_universe(ctx[s]["profile"], cfg["universe"])} for pid, cfg in PORTFOLIOS.items()}
+        reviewable = set().union(*universe_of.values()) | (held_any & set(ctx))
+        not_in_any = sorted(set(ctx) - reviewable)
+        if not_in_any:
+            self.notes.append(f"outside every portfolio's universe, not reviewed: {', '.join(not_in_any)}")
 
-        def siblings(s: str) -> list[str]:
-            return [h for h in state.weights if h != s and company.get(s) and company.get(h) == company.get(s)]
-
-        consolidated = self._consolidate_share_classes(as_of, held, company, pending)
-        second_class = [s for s in ctx if s not in held and siblings(s)]
-        if second_class:
-            self.notes.append(f"another share class already held, not reviewed: {', '.join(second_class)}")
-        excluded = excluded | set(consolidated) | set(second_class)
-
-        order = [s for s in ctx if s in held] + [s for s in ctx if s not in held]
-        to_review = [s for s in order if s not in excluded and s not in pending and self._needs_review(s, ctx[s], as_of)]
+        # 1. views, shared by every portfolio
+        order = [s for s in ctx if s in held_any] + [s for s in ctx if s not in held_any]
+        to_review = [s for s in order if s in reviewable and s not in excluded and self._needs_review(s, ctx[s], as_of)]
         to_review = to_review[: DECISION["max_reviews_per_day"]]
-        dossiers = {s: self._dossier(s, ctx[s], as_of, state, regime, market, held.get(s), DECISION["max_new_positions_per_day"]) for s in to_review}
-
-        def ask(s: str) -> dict[str, Any] | Exception:
-            try:
-                return self._ask(dossiers[s], s in held)
-            except Exception as e:  # returned, not raised, so one failure doesn't cancel the others
-                return e
-
-        # reasoning calls are slow (about a minute each), so several run at once; results keep review order
-        reviews: list[dict[str, Any]] = []
-        budget_hit = None
-        with ThreadPoolExecutor(max_workers=DECISION["parallel_reviews"]) as pool:
-            for s, answer in zip(to_review, pool.map(ask, to_review)):
-                if isinstance(answer, BudgetExceeded):
-                    budget_hit = answer
-                elif isinstance(answer, Exception):
-                    log.warning("decision for %s failed: %s", s, answer)
-                    self.notes.append(f"review failed for {s}: {type(answer).__name__}")
-                else:
-                    reviews.append({"symbol": s, "dossier": dossiers[s], "answer": answer})
-        if budget_hit:
-            self.alerts.alert("LLM budget cap reached", f"{budget_hit}. No more reviews this month; positions are held as they are.")
-        held_unreviewed = [s for s in held if s not in ctx]
+        dossiers = {s: self._dossier(s, ctx[s], as_of, market) for s in to_review}
+        answers, budget_hit = self._parallel(to_review, lambda s: self._ask_view(dossiers[s]), "view")
+        views = self._record_views(as_of, {s: (dossiers[s], a) for s, a in answers.items()}, market)
+        held_unreviewed = sorted(s for s in held_any if s not in ctx)
         if held_unreviewed:
             self.notes.append(f"held but no price today, not reviewed: {', '.join(held_unreviewed)}")
 
-        # code enforcement: exits first, then buys by confidence through the risk overlay
-        buys = 0
-        for rv in sorted(reviews, key=lambda r: (r["answer"]["action"] != "EXIT", -(r["answer"]["confidence"] or 0))):
-            a, s = rv["answer"], rv["symbol"]
-            sector = ctx[s]["profile"]["sector"]
-            grounded = a["checks"]["number_grounding"] == "pass" and a["checks"]["schema"] == "pass"
-            rv["risk"], rv["required"] = {}, None
-            if a["action"] == "EXIT":
-                rv["outcome"] = "EXECUTED" if a["checks"]["schema"] == "pass" else "REJECTED_SCHEMA"
-            elif a["action"] == "ACCUMULATE":
-                req, why = risk.required_confidence(sector, state, regime)
-                rv["required"] = req
-                if not grounded:
-                    rv["outcome"] = "REJECTED_GROUNDING" if a["checks"]["schema"] == "pass" else "REJECTED_SCHEMA"
-                elif (a["confidence"] or 0) < req:
-                    rv["outcome"] = "SKIP_CONFIDENCE"
-                    rv["risk"] = {"required_confidence": req, "reasons": why}
-                elif buys >= DECISION["max_new_positions_per_day"]:
-                    rv["outcome"] = "SKIP_DAILY_LIMIT"
-                else:
-                    ok, details = risk.check_buy(s, sector, a["target_allocation"], risk.beta(rets.get(s, {}), spy), state, rets, siblings(s))
-                    details["required_confidence"], details["reasons"] = req, why
-                    rv["risk"] = details
-                    if ok:
-                        rv["outcome"] = "EXECUTED"
-                        state.weights[s], state.sectors[s] = a["target_allocation"], sector
-                        if (b := risk.beta(rets.get(s, {}), spy)) is not None:
-                            state.betas[s] = b
-                        buys += 1
-                    else:
-                        rv["outcome"] = "SKIP_RISK"
-            else:
-                rv["outcome"] = "NO_TRADE"
-        return [f"EXIT {s} (EXECUTED, share-class consolidation)" for s in consolidated] + self._record_decisions(as_of, reviews, market)
+        hedge_syms = {s for held in held_by.values() for s, p in held.items() if p.get("kind") == "hedge"}
+        rets = self._returns(sorted(held_any | set(ctx) | hedge_syms | set(BENCHMARKS)), as_of)
+        spy = rets.get("SPY", {})
+        benchmark_of = {s: c["benchmark"] for s, c in ctx.items()} | {
+            r["symbol"]: r["benchmark"] for r in self.db.query("SELECT symbol, benchmark FROM symbols WHERE benchmark IS NOT NULL") if r["symbol"] not in ctx
+        }
+        states = {}
+        for pid in PORTFOLIOS:
+            nav = float(self.db.scalar("SELECT nav FROM nav WHERE portfolio_id = :p AND date = :d", {"p": pid, "d": as_of}))
+            states[pid] = self._state(pid, held_by[pid], nav, rets)
 
-    def _consolidate_share_classes(self, as_of: str, held: dict[str, Any], company: dict[str, str], pending: set[str]) -> list[str]:
-        """When two share classes of one company are held, sell all but the most traded one (by dollar volume,
-        then by position size). A code decision, recorded like any other, with no model call. Returns the sold symbols."""
-        groups: dict[str, list[str]] = defaultdict(list)
-        for s in held:
-            if company.get(s) and s not in pending:
-                groups[company[s]].append(s)
-        dv = self._dollar_volume([s for g in groups.values() if len(g) > 1 for s in g], as_of)
-        sold, out, decision_rows, order_rows = [], [], [], []
-        for group in groups.values():
-            if len(group) < 2:
-                continue
-            keep = max(group, key=lambda s: (dv.get(s) or 0.0, held[s]["value"], s))
-            for s in sorted(set(group) - {keep}):
-                decision_id = f"{as_of}-{s}"
-                why = (
-                    f"{s} and {keep} are share classes of the same company, so they count as one position. "
-                    f"Keeping {keep}, the more actively traded class, and selling {s}."
-                )
-                record = {
-                    "decision_id": decision_id,
-                    "as_of": f"{as_of}T21:00:00Z",
-                    "ticker": s,
-                    "sector": held[s]["sector"],
-                    "held": True,
-                    "action": "EXIT",
-                    "outcome": "EXECUTED",
-                    "target_allocation": 0.0,
-                    "confidence": None,
-                    "required_confidence": None,
-                    "thesis": [why],
-                    "framework_views": {},
-                    "decided_by": "code: share-class consolidation",
-                    "kept_class": keep,
-                    "dollar_volume": {k: dv.get(k) for k in group},
+        # 2. code exits that need no model: share-class doubles and short stops
+        actions: dict[str, list[dict[str, Any]]] = {pid: [] for pid in PORTFOLIOS}
+        closing: dict[str, set[str]] = {pid: set() for pid in PORTFOLIOS}
+        for pid in PORTFOLIOS:
+            held, pending = held_by[pid], pending_by[pid]
+            for s in self._share_class_doubles(as_of, held, company, pending):
+                p = held[s]
+                actions[pid].append(self._code_action(pid, as_of, s, "EXIT" if p.get("side", "long") == "long" else "COVER", "code: share-class consolidation",
+                                                      f"{s} is a second share class of a company already held in this portfolio.", p["sector"]))
+                closing[pid].add(s)
+            for s, p in held.items():
+                if p.get("side") == "short" and p.get("kind") == "stock" and s not in pending and s not in closing[pid]:
+                    price = ctx[s]["price"] if s in ctx else p["last_close"]
+                    if price >= p["entry_price"] * (1 + SHORT["stop_loss"]):
+                        actions[pid].append(self._code_action(pid, as_of, s, "COVER", "code: short stop",
+                                                              f"Price {price:.2f} is {price / p['entry_price'] - 1:.0%} above the short entry {p['entry_price']:.2f}; the stop is {SHORT['stop_loss']:.0%}.", p["sector"]))
+                        closing[pid].add(s)
+
+        # 3. position calls: the model decides whether each portfolio keeps each open position with a fresh view
+        calls = [
+            (pid, s)
+            for pid in PORTFOLIOS
+            for s, p in held_by[pid].items()
+            if p.get("kind", "stock") == "stock" and s in views and s not in pending_by[pid] and s not in closing[pid] and views[s]["checks"]["schema"] == "pass"
+        ]
+        cases = {(pid, s): self._position_case(pid, held_by[pid][s], views[s], states[pid], as_of, rets) for pid, s in calls}
+
+        def max_w(pid: str, s: str) -> float:
+            return SHORT["max_position_weight"] if held_by[pid][s].get("side") == "short" else DECISION["max_position_weight"]
+
+        answers_p, hit_p = self._parallel(calls, lambda k: self._ask_position(cases[k], max_w(*k)), "position")
+        budget_hit = budget_hit or hit_p
+        for (pid, s), a in answers_p.items():
+            p = held_by[pid][s]
+            closes = a["action"] in ("EXIT", "COVER") and a["checks"]["schema"] == "pass"
+            actions[pid].append(
+                {
+                    "symbol": s, "action": a["action"], "outcome": "EXECUTED" if closes else "NO_TRADE", "side": p.get("side", "long"),
+                    "target_allocation": a["target_allocation"], "decided_by": "model: position call", "reason": a["reason"],
+                    "case": cases[(pid, s)], "checks": a["checks"], "sector": p["sector"],
+                    "thesis_ok": 1 if a["checks"]["number_grounding"] == "pass" else 0,
                 }
-                decision_rows.append(
-                    {
-                        "decision_id": decision_id, "as_of": record["as_of"], "date": as_of, "symbol": s, "action": "EXIT",
-                        "target_weight": 0.0, "confidence": None, "record": json.dumps(record, default=str), "snapshot_hash": None,
-                        "resolve_on": None, "thesis_ok": 1, "executed": 1,
-                    }
-                )
-                order_rows.append(
-                    {
-                        "order_id": decision_id, "portfolio_id": CORE, "decision_id": decision_id, "symbol": s, "side": "SELL", "target_weight": 0.0,
-                        "created_date": as_of, "status": "pending", "fill_date": None, "fill_price": None, "amount": None,
-                    }
-                )
-                sold.append(s)
-                out.append(f"EXIT {s} (EXECUTED, share-class consolidation; keeping {keep})")
-        if decision_rows:
-            self.db.upsert("decisions", decision_rows, ["decision_id"], update=False)
-            self.db.upsert("orders", order_rows, ["order_id"], update=False)
-            self.notes.append("share-class consolidation: " + "; ".join(out))
-        return sold
+            )
+            if closes:
+                closing[pid].add(s)
 
-    def _record_decisions(self, as_of: str, reviews: list[dict[str, Any]], market: dict[str, Any]) -> list[str]:
-        if not reviews:
-            self.notes.append("decisions: no names needed review")
-            return []
-        versions = {
+        # 4. entries from the view, by code, within each portfolio's limits
+        for pid, cfg in PORTFOLIOS.items():
+            state, held, pending = states[pid], held_by[pid], pending_by[pid]
+            for s in closing[pid]:
+                state.weights.pop(s, None)
+                state.shorts.pop(s, None)
+            can_short = "short" in cfg["strategy"]
+            stopped = {
+                r["symbol"]
+                for r in self.db.query(
+                    "SELECT symbol FROM decisions WHERE portfolio_id = :p AND action = 'COVER' AND date >= :a AND record LIKE :k",
+                    {"p": pid, "a": _minus(as_of, SHORT["stop_cooldown_days"]), "k": "%code: short stop%"},
+                )
+            } | {s for s, a in ((a["symbol"], a) for a in actions[pid]) if a.get("decided_by") == "code: short stop"}
+            cands = [s for s in views if s in universe_of[pid] and s not in held and s not in pending]
+            cands.sort(key=lambda s: -abs((views[s]["p_outperform"] or 0.5) - 0.5))
+            new = 0
+            for s in cands:
+                v, c = views[s], ctx[s]
+                sector = c["profile"]["sector"]
+                p = v["p_outperform"]
+                grounded = v["checks"]["number_grounding"] == "pass" and v["checks"]["schema"] == "pass"
+                req, why = risk.required_confidence(sector, state, regime)
+                held_class = [h for h in list(state.weights) + list(state.shorts) if h != s and company.get(s) and company.get(h) == company.get(s)]
+                act = {"symbol": s, "sector": sector, "decided_by": "code: entry rule", "risk": {}, "thesis_ok": 1 if grounded else 0}
+                if p is not None and p >= req:
+                    act.update(action="ACCUMULATE", side="long", required=req, target_allocation=min(max(v["target_allocation"] or 0.025, DECISION["min_position_weight"]), DECISION["max_position_weight"]))
+                elif p is not None and can_short and p <= SHORT["max_p"] and s not in stopped:
+                    act.update(action="SHORT", side="short", required=SHORT["max_p"], target_allocation=min(max(v["target_allocation"] or 0.02, SHORT["min_position_weight"]), SHORT["max_position_weight"]))
+                else:
+                    act.update(action="PASS", outcome="NO_TRADE", required=req, target_allocation=0.0, risk={"required_confidence": req, "reasons": why} if why else {})
+                    actions[pid].append(act)
+                    continue
+                if not grounded:
+                    act["outcome"] = "REJECTED_GROUNDING" if v["checks"]["schema"] == "pass" else "REJECTED_SCHEMA"
+                elif new >= DECISION["max_new_positions_per_day"]:
+                    act["outcome"] = "SKIP_DAILY_LIMIT"
+                else:
+                    w, b = act["target_allocation"], risk.beta(rets.get(s, {}), spy)
+                    if act["side"] == "long":
+                        ok, details = risk.check_buy(s, sector, w, b, state, rets, held_class)
+                        details["required_confidence"], details["reasons"] = req, why
+                    else:
+                        ok, details = risk.check_short(s, sector, w, c["price"], c["market_cap"], state, held_class)
+                    act["risk"] = details
+                    act["outcome"] = "EXECUTED" if ok else "SKIP_RISK"
+                    if ok:
+                        (state.weights if act["side"] == "long" else state.shorts)[s] = w
+                        state.sectors[s] = sector
+                        if b is not None:
+                            state.betas[s] = b
+                        new += 1
+                actions[pid].append(act)
+
+            # 5. hedges, sized on the book as it will stand after today's orders
+            if cfg.get("hedge"):
+                for etf in [e for e in rets if e not in state.betas and e in BENCHMARKS]:
+                    if (b := risk.beta(rets.get(etf, {}), spy)) is not None:
+                        state.betas[etf] = b
+                targets = risk.hedge_targets(state, cfg["hedge"], benchmark_of)
+                for etf in sorted(set(targets) | set(state.hedges)):
+                    cur, tgt = state.hedges.get(etf, 0.0), targets.get(etf, 0.0)
+                    if etf in pending or (abs(tgt - cur) < HEDGE["rebalance_threshold"] and not (tgt == 0 and cur > 0)):
+                        continue
+                    note = (f"Book beta before hedges is {state.stock_beta():.2f}; the target is {HEDGE['market_target_beta']}." if cfg["hedge"] == "market"
+                            else f"Net long weight measured against {etf} is {tgt:.1%}.")
+                    act = self._code_action(pid, as_of, etf, "HEDGE", f"code: {cfg['hedge']} hedge", note, "Hedge")
+                    act.update(target_allocation=tgt, side="short", current=round(cur, 4))
+                    actions[pid].append(act)
+
+        if budget_hit:
+            self.alerts.alert("LLM budget cap reached", f"{budget_hit}. No more model calls this month; positions are held as they are.")
+        return self._record_actions(as_of, actions, views)
+
+    def _parallel(self, keys: list, fn, label: str) -> tuple[dict, Exception | None]:
+        """Run model calls a few at a time (each takes up to a minute). Failures are noted, not raised, so one bad
+        call doesn't cancel the rest; a budget stop is returned for the caller to alert on."""
+        out, budget_hit = {}, None
+
+        def run(k):
+            try:
+                return fn(k)
+            except Exception as e:  # returned, not raised
+                return e
+
+        with ThreadPoolExecutor(max_workers=DECISION["parallel_reviews"]) as pool:
+            for k, a in zip(keys, pool.map(run, keys)):
+                if isinstance(a, BudgetExceeded):
+                    budget_hit = a
+                elif isinstance(a, Exception):
+                    log.warning("%s call for %s failed: %s", label, k, a)
+                    self.notes.append(f"{label} call failed for {k}: {type(a).__name__}")
+                else:
+                    out[k] = a
+        return out, budget_hit
+
+    def _share_class_doubles(self, as_of: str, held: dict[str, Any], company: dict[str, str], pending: set[str]) -> list[str]:
+        """Share classes of one company count as one position. When a portfolio holds two (same side), all but the
+        most traded one (by dollar volume, then by position size) are closed. Returns the symbols to close."""
+        groups: dict[tuple, list[str]] = defaultdict(list)
+        for s, p in held.items():
+            if company.get(s) and s not in pending and p.get("kind", "stock") == "stock":
+                groups[(company[s], p.get("side", "long"))].append(s)
+        dv = self._dollar_volume([s for g in groups.values() if len(g) > 1 for s in g], as_of)
+        out = []
+        for group in groups.values():
+            if len(group) > 1:
+                keep = max(group, key=lambda s: (dv.get(s) or 0.0, held[s]["value"], s))
+                out += sorted(set(group) - {keep})
+        return out
+
+    @staticmethod
+    def _code_action(pid: str, as_of: str, symbol: str, action: str, decided_by: str, why: str, sector: str | None) -> dict[str, Any]:
+        return {
+            "symbol": symbol, "action": action, "outcome": "EXECUTED", "decided_by": decided_by, "reason": [why],
+            "target_allocation": 0.0, "sector": sector, "thesis_ok": 1, "side": "short" if action in ("COVER", "HEDGE") else "long",
+        }
+
+    def _versions(self) -> dict[str, Any]:
+        return {
             "code_version": self.s.code_version,
             "framework": FRAMEWORK_VERSION,
             "rubric_version": RUBRIC_VERSION,
@@ -941,46 +1079,44 @@ class Pipeline:
             "decision_prompt_version": DECISION_PROMPT_VERSION,
             "models": {"scorer": self.s.scoring_model, "decision": self.s.decision_model if not self.llm.fake else "fake"},
         }
+
+    def _record_views(self, as_of: str, reviews: dict[str, tuple[dict[str, Any], dict[str, Any]]], market: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        """Store today's views with a content-hashed snapshot of every input. Returns {symbol: view record}."""
+        if not reviews:
+            self.notes.append("views: no names needed review")
+            return {}
+        versions = self._versions()
         snapshot = {
             "as_of": as_of,
             **versions,
             "framework_params": FRAMEWORK,
             "decision_params": DECISION,
             "risk_params": RISK,
+            "short_params": SHORT,
+            "hedge_params": HEDGE,
             "market": _r(market),
-            "inputs": {
-                rv["symbol"]: {"dossier": rv["dossier"], "answer": rv["answer"], "facts": self._pit_subset(rv["symbol"], as_of)}
-                for rv in reviews
-            },
+            "inputs": {s: {"dossier": ds, "answer": a, "facts": self._pit_subset(s, as_of)} for s, (ds, a) in reviews.items()},
         }
         digest = save_snapshot(self.db, as_of, snapshot)
-        resolve_on = (date.fromisoformat(as_of) + timedelta(days=round(EVALUATION["decision_horizon"] * 365 / 252))).isoformat()
-        out, decision_rows, order_rows = [], [], []
-        for rv in reviews:
-            s, a, ds = rv["symbol"], rv["answer"], rv["dossier"]
-            decision_id = f"{as_of}-{s}"
-            executed = rv["outcome"] == "EXECUTED"
+        h = EVALUATION["decision_horizon"]
+        resolve_on = (date.fromisoformat(as_of) + timedelta(days=round(h * 365 / 252))).isoformat()
+        out, rows = {}, []
+        for s, (ds, a) in reviews.items():
+            view_id = f"{as_of}-{s}"
             record = {
-                "decision_id": decision_id,
+                "view_id": view_id,
                 "as_of": f"{as_of}T21:00:00Z",
                 "snapshot_hash": digest,
                 **versions,
                 "ticker": s,
                 "name": ds["name"],
                 "sector": ds["sector"],
-                "held": ds["held"],
-                "action": a["action"],
-                "outcome": rv["outcome"],
-                "target_allocation": a["target_allocation"],
-                "confidence": a["confidence"],
-                "required_confidence": rv["required"],
-                "thesis": a["thesis"],
-                "framework_views": a["framework_views"],
-                "key_risks": a["key_risks"],
-                "lessons_applied": a["lessons_applied"],
-                "checks": a["checks"],
-                "risk": rv["risk"],
+                "industry": ds["industry"],
+                "benchmark": ds["benchmark"]["etf"],
+                "horizon_trading_days": h,
+                **{k: a[k] for k in ("p_outperform", "target_allocation", "thesis", "counter_case", "framework_views", "key_risks", "lessons_applied", "checks")},
                 "dossier_price": ds["price"],
+                "dossier_benchmark": ds["benchmark"],
                 "computed": {
                     "attention": ds["attention"],
                     "graham": {k: v for k, v in ds["graham"].items() if k != "criteria"},
@@ -990,44 +1126,65 @@ class Pipeline:
                 },
                 "resolve_on": resolve_on,
             }
-            decision_rows.append(
+            out[s] = record
+            rows.append(
                 {
-                    "decision_id": decision_id,
-                    "as_of": record["as_of"],
-                    "date": as_of,
-                    "symbol": s,
-                    "action": a["action"],
-                    "target_weight": a["target_allocation"],
-                    "confidence": a["confidence"],
-                    "record": json.dumps(record, default=str),
-                    "snapshot_hash": digest,
-                    "resolve_on": resolve_on,
-                    "thesis_ok": 1 if a["checks"]["number_grounding"] == "pass" else 0,
-                    "executed": 1 if executed else 0,
+                    "view_id": view_id, "as_of": record["as_of"], "date": as_of, "symbol": s, "benchmark": record["benchmark"],
+                    "p": a["p_outperform"], "horizon": h, "target_weight": a["target_allocation"], "record": json.dumps(record, default=str),
+                    "snapshot_hash": digest, "resolve_on": resolve_on, "thesis_ok": 1 if a["checks"]["number_grounding"] == "pass" else 0,
                 }
             )
-            if executed and a["action"] in ("ACCUMULATE", "EXIT"):
-                order_rows.append(
+        self.db.upsert("views", rows, ["view_id"], update=False)
+        bad = sum(1 for r in rows if not r["thesis_ok"])
+        self.notes.append(f"views: {len(rows)} stocks reviewed" + (f", {bad} with ungrounded numbers" if bad else ""))
+        return out
+
+    def _record_actions(self, as_of: str, actions: dict[str, list[dict[str, Any]]], views: dict[str, dict[str, Any]]) -> list[str]:
+        """One decisions row per portfolio per stock acted on or passed, and an order for every executed trade."""
+        side_of = {"ACCUMULATE": "BUY", "EXIT": "SELL", "SHORT": "SHORT", "COVER": "COVER", "HEDGE": "HEDGE"}
+        out, decision_rows, order_rows = [], [], []
+        for pid, acts in actions.items():
+            n_pass = 0
+            for a in acts:
+                s = a["symbol"]
+                decision_id = f"{as_of}-{s}" if pid == CORE else f"{pid}:{as_of}-{s}"
+                v = views.get(s)
+                executed = a["outcome"] == "EXECUTED" and a["action"] in side_of
+                record = {
+                    "decision_id": decision_id,
+                    "portfolio_id": pid,
+                    "view_id": v["view_id"] if v else None,
+                    "as_of": f"{as_of}T21:00:00Z",
+                    "ticker": s,
+                    "sector": a.get("sector"),
+                    **{k: a.get(k) for k in ("action", "outcome", "side", "target_allocation", "decided_by", "required", "risk", "reason", "case", "checks", "current")},
+                    "p_outperform": v["p_outperform"] if v else None,
+                }
+                decision_rows.append(
                     {
-                        "order_id": decision_id,
-                        "portfolio_id": CORE,
-                        "decision_id": decision_id,
-                        "symbol": s,
-                        "side": "BUY" if a["action"] == "ACCUMULATE" else "SELL",
-                        "target_weight": a["target_allocation"],
-                        "created_date": as_of,
-                        "status": "pending",
-                        "fill_date": None,
-                        "fill_price": None,
-                        "amount": None,
+                        "decision_id": decision_id, "portfolio_id": pid, "view_id": record["view_id"], "as_of": record["as_of"], "date": as_of,
+                        "symbol": s, "action": a["action"], "target_weight": a.get("target_allocation"), "confidence": record["p_outperform"],
+                        "record": json.dumps({k: x for k, x in record.items() if x is not None}, default=str),
+                        "snapshot_hash": v["snapshot_hash"] if v else None, "resolve_on": v["resolve_on"] if v else None,
+                        "thesis_ok": a.get("thesis_ok"), "executed": 1 if executed else 0,
                     }
                 )
-            if a["action"] in ("ACCUMULATE", "EXIT") or rv["outcome"] != "NO_TRADE":
-                out.append(f"{a['action']} {s} ({rv['outcome']}, conf {a['confidence']})")
+                if executed:
+                    order_rows.append(
+                        {
+                            "order_id": decision_id, "portfolio_id": pid, "decision_id": decision_id, "symbol": s, "side": side_of[a["action"]],
+                            "target_weight": a.get("target_allocation") or 0.0, "created_date": as_of, "status": "pending",
+                            "fill_date": None, "fill_price": None, "amount": None,
+                        }
+                    )
+                if a["action"] == "PASS" or (a["action"] == "HOLD" and a["outcome"] == "NO_TRADE"):
+                    n_pass += 1
+                else:
+                    p = f", p {record['p_outperform']}" if record["p_outperform"] is not None else ""
+                    out.append(f"{a['action']} {s} [{pid}] ({a['outcome']}{p})")
+            self.notes.append(f"[{pid}] {len(acts)} actions, {n_pass} hold/pass")
         self.db.upsert("decisions", decision_rows, ["decision_id"], update=False)
         self.db.upsert("orders", order_rows, ["order_id"], update=False)
-        holds = sum(1 for rv in reviews if rv["outcome"] == "NO_TRADE")
-        self.notes.append(f"decisions: {len(reviews)} reviewed, {holds} hold/pass; " + (", ".join(out) or "no trades"))
         return out
 
     def _pit_subset(self, symbol: str, as_of: str) -> dict[str, Any]:
@@ -1067,7 +1224,6 @@ class Pipeline:
         learning.run_postmortems(self.db, self.llm, panel, as_of, SECTOR_ETFS, self.notes)
         casestudies.write_case_studies(self.db, self.llm, panel, as_of, SECTOR_ETFS, self.notes)
         new_lessons = learning.update_lessons(self.db, as_of)
-        m = metrics(self.db)
         ic = evaluation.ic_summary(self.db)
         brier = evaluation.decision_brier(self.db, panel)
         cons = evaluation.consistency_rate(self.db)
@@ -1083,13 +1239,19 @@ class Pipeline:
         lines = [
             f"# AMIA monthly report: {as_of[:7]}",
             "",
-            "## Portfolio (benchmarks: SPY, sector ETFs, T-bills)",
-            *(f"- {k}: {v:.4f}" if isinstance(v, float) else f"- {k}: {v}" for k, v in m.items()),
-            "",
+            *(
+                line
+                for pid, cfg in PORTFOLIOS.items()
+                for line in (
+                    f"## Portfolio: {cfg['name']} ({cfg['strategy']}{', ' + cfg['hedge'] + ' hedge' if cfg.get('hedge') else ''})",
+                    *(f"- {k}: {v:.4f}" if isinstance(v, float) else f"- {k}: {v}" for k, v in metrics(self.db, pid).items()),
+                    "",
+                )
+            ),
             "## Which inputs predict returns vs SPY (rank IC by lens)",
             *(ic_line(lens) for lens in ic),
             "",
-            "## Calibration of the model's confidence",
+            f"## Calibration of the views (P(beat the benchmark ETF over {EVALUATION['decision_horizon']} trading days))",
             f"- {json.dumps(brier)}",
             "",
             "## Logic checks",
@@ -1100,7 +1262,7 @@ class Pipeline:
             *(f"- {p['symbol']} ({p['case_type']}): {p['cause']}; {p['lens']} {p['adjustment']}. {p['explanation']}" for p in pms),
             "",
             f"## Case studies this month ({len(studies)})",
-            *(f"- {c['symbol']} ({c['checkpoint']}, {c['verdict']}): {c['title']}. Beat SPY by {c['excess_spy']:+.1%}, sector ETF by {c['excess_sector']:+.1%}." for c in studies),
+            *(f"- {c['symbol']} ({c['checkpoint']}, {c['verdict']}): {c['title']}. Beat SPY by {c['excess_spy']:+.1%}, its benchmark ETF by {c['excess_sector']:+.1%}." for c in studies),
             "",
             f"## Lessons ({len(lessons)} active, {len(new_lessons)} new)",
             *(f"- [{lsn['sector']} | {lsn['lens']} {lsn['adjustment']}] {lsn['guidance']} ({lsn['n_cases']} cases)" for lsn in lessons),

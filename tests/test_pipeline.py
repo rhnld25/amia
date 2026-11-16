@@ -1,8 +1,8 @@
 import json
 import os
-from datetime import date
+from datetime import date, timedelta
 
-from amia.config import Settings
+from amia.config import PORTFOLIOS, SHORT, Settings
 from amia.data.mock import NO_SEC, MockProviders, trading_days
 from amia.db import DB
 from amia.pipeline import Pipeline
@@ -42,27 +42,55 @@ def test_mock_run_end_to_end(tmp_path):
     assert distinct > max(r["n"] for r in by_day)
     assert db.scalar("SELECT COUNT(*) FROM watchlist WHERE symbol = 'BTCUSD'") == 0  # not an equity ticker
 
-    # a ticker with no SEC filings still gets reviewed, told its fundamentals are missing
-    nosec = db.query("SELECT record FROM decisions WHERE symbol = :s LIMIT 1", {"s": NO_SEC})
-    assert nosec and json.loads(nosec[0]["record"])["computed"]["graham"]["available"] is False
+    # a ticker with no SEC filings is outside every portfolio's universe (US stocks), so it gets no view
+    assert db.scalar("SELECT COUNT(*) FROM views WHERE symbol = :s", {"s": NO_SEC}) == 0
+    assert db.scalar("SELECT COUNT(*) FROM watchlist WHERE symbol = :s", {"s": NO_SEC}) > 0
 
+    # one view per stock per review, shared by every portfolio, with its inputs in a content-hashed snapshot
+    views = db.query("SELECT * FROM views")
+    assert views
+    v = json.loads(views[0]["record"])
+    assert set(v["framework_views"]) == {"graham", "buffett", "marks"} and v["counter_case"]
+    assert v["checks"]["number_grounding"] == "pass" and v["benchmark"] == views[0]["benchmark"]
+    snap = load_snapshot(db, v["snapshot_hash"])
+    assert snap and v["ticker"] in snap["inputs"] and "dossier" in snap["inputs"][v["ticker"]]
+
+    # each portfolio acts on the views within its strategy
+    acts = {(r["portfolio_id"], r["action"]) for r in db.query("SELECT DISTINCT portfolio_id, action FROM decisions WHERE executed = 1")}
+    for pid in PORTFOLIOS:
+        assert (pid, "ACCUMULATE") in acts
+    assert ("core_ls", "SHORT") in acts and ("core_lsh", "SHORT") in acts
+    assert ("core_hedged", "HEDGE") in acts and ("core_lsh", "HEDGE") in acts
+    assert not {("core", "SHORT"), ("core", "HEDGE"), ("core_hedged", "SHORT"), ("core_ls", "HEDGE")} & acts
+    # entries follow the view by rule: longs at p >= the required bar, shorts only at p <= 0.30
+    for r in db.query("SELECT action, confidence, record FROM decisions WHERE action IN ('ACCUMULATE', 'SHORT') AND executed = 1"):
+        rec = json.loads(r["record"])
+        assert (r["confidence"] >= rec["required"]) if r["action"] == "ACCUMULATE" else (r["confidence"] <= SHORT["max_p"])
+    # after a short is stopped out, that portfolio leaves the stock alone for the cooldown
+    stops = db.query("SELECT portfolio_id, symbol, date FROM decisions WHERE action = 'COVER' AND record LIKE '%short stop%'")
+    assert stops  # the mock market runs at least one short into its stop
+    for c in stops:
+        again = db.scalar(
+            "SELECT COUNT(*) FROM decisions WHERE portfolio_id = :p AND symbol = :s AND action = 'SHORT' AND executed = 1 AND date > :d AND date <= :e",
+            {"p": c["portfolio_id"], "s": c["symbol"], "d": c["date"], "e": (date.fromisoformat(c["date"]) + timedelta(days=SHORT["stop_cooldown_days"])).isoformat()},
+        )
+        assert again == 0, c
+    # open positions are judged by the model, one call per position per portfolio
+    calls = db.query("SELECT record FROM decisions WHERE action IN ('HOLD', 'EXIT', 'COVER')")
+    assert calls and all(json.loads(c["record"])["decided_by"] in ("model: position call", "code: short stop", "code: share-class consolidation") for c in calls)
+    for pid in PORTFOLIOS:
+        shorts = db.scalar("SELECT COALESCE(SUM(value), 0) FROM positions WHERE portfolio_id = :p AND side = 'short' AND kind = 'stock'", {"p": pid})
+        assert shorts <= SHORT["max_total_weight"] * metrics(db, pid)["nav"] * 1.1  # the cap holds (prices drift after entry)
+
+    # only executed actions become orders, and they fill on a later day at the open
     decisions = db.query("SELECT * FROM decisions")
-    assert decisions
-    assert any(d["action"] == "ACCUMULATE" and d["executed"] for d in decisions)
-    rec = json.loads(decisions[0]["record"])
-    assert set(rec["framework_views"]) == {"graham", "buffett", "marks"}
-    assert rec["checks"]["number_grounding"] == "pass"
-    snap = load_snapshot(db, rec["snapshot_hash"])
-    assert snap and rec["ticker"] in snap["inputs"] and "dossier" in snap["inputs"][rec["ticker"]]
-
-    # only executed buys and exits become orders, and they fill on a later day at the open
-    executed = {d["decision_id"] for d in decisions if d["executed"] and d["action"] in ("ACCUMULATE", "EXIT")}
+    executed = {d["decision_id"] for d in decisions if d["executed"]}
     assert {o["decision_id"] for o in db.query("SELECT decision_id FROM orders")} == executed
     for o in db.query("SELECT * FROM orders WHERE status = 'filled'"):
         assert o["fill_date"] > o["created_date"]
 
-    m = metrics(db)
-    assert m["days"] == len(days) - 1
+    for pid in PORTFOLIOS:
+        assert metrics(db, pid)["days"] == len(days) - 1
     for r in db.query("SELECT nav, cash, invested FROM nav"):
         assert abs(r["nav"] - r["cash"] - r["invested"]) < 1e-6
 
@@ -71,15 +99,18 @@ def test_mock_run_end_to_end(tmp_path):
     pipe.daily(days[-1].isoformat(), facts_limit=1000, live_clock=False)
     assert db.scalar("SELECT COUNT(*) FROM decisions") == before
 
-    # monthly post-mortems cover every position closed in the window
+    # monthly post-mortems cover every trade closed in the window once, however many portfolios made it
     report = pipe.monthly_report("2024-05-01")
-    closed = db.scalar("SELECT COUNT(*) FROM closed_positions WHERE closed_date >= '2024-03-01'")  # this month and last
-    assert db.scalar("SELECT COUNT(*) FROM postmortems WHERE case_type = 'closed_position'") == closed
+    trades = db.scalar(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT symbol, opened_date, side FROM closed_positions WHERE kind = 'stock' AND closed_date >= '2024-03-01') t"
+    )
+    assert trades and db.scalar("SELECT COUNT(*) FROM postmortems WHERE case_type = 'closed_position'") == trades
     assert "Which inputs predict returns vs SPY" in report
 
     build_site(db, str(tmp_path / "site"))
     page = (tmp_path / "site" / "index.html").read_text()
-    assert "AMIA paper portfolio" in page and "watchlist (from news traction)" in page and "T-bills" in page
+    assert "AMIA paper portfolios" in page and "watchlist (from news traction)" in page and "T-bills" in page
+    assert all(cfg["name"] in page for cfg in PORTFOLIOS.values())
 
 
 def test_market_closed_day_makes_no_decisions(tmp_path):

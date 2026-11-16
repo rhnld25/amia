@@ -64,8 +64,12 @@ CREATE TABLE IF NOT EXISTS market_state (
     date TEXT PRIMARY KEY, regime_flags INTEGER, temperature_score INTEGER, record TEXT);
 CREATE TABLE IF NOT EXISTS snapshots (
     hash TEXT PRIMARY KEY, date TEXT, created_at TEXT, data {BLOB});
+CREATE TABLE IF NOT EXISTS views (
+    view_id TEXT PRIMARY KEY, as_of TEXT, date TEXT, symbol TEXT, benchmark TEXT, p {REAL}, horizon INTEGER,
+    target_weight {REAL}, record TEXT, snapshot_hash TEXT, resolve_on TEXT, thesis_ok INTEGER);
+CREATE INDEX IF NOT EXISTS views_symbol ON views (symbol, date);
 CREATE TABLE IF NOT EXISTS decisions (
-    decision_id TEXT PRIMARY KEY, as_of TEXT, date TEXT, symbol TEXT, action TEXT, target_weight {REAL},
+    decision_id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', view_id TEXT, as_of TEXT, date TEXT, symbol TEXT, action TEXT, target_weight {REAL},
     confidence {REAL}, record TEXT, snapshot_hash TEXT, resolve_on TEXT, thesis_ok INTEGER, executed INTEGER);
 CREATE INDEX IF NOT EXISTS decisions_symbol ON decisions (symbol, date);
 CREATE TABLE IF NOT EXISTS portfolios (
@@ -77,11 +81,13 @@ CREATE TABLE IF NOT EXISTS orders (
 CREATE TABLE IF NOT EXISTS positions (
     portfolio_id TEXT NOT NULL DEFAULT 'core', symbol TEXT NOT NULL, sector TEXT, opened_date TEXT,
     entry_price {REAL}, value {REAL}, cost {REAL}, decision_id TEXT, last_close {REAL},
+    side TEXT NOT NULL DEFAULT 'long', kind TEXT NOT NULL DEFAULT 'stock',
     PRIMARY KEY (portfolio_id, symbol));
 CREATE TABLE IF NOT EXISTS closed_positions (
     id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', symbol TEXT, sector TEXT, opened_date TEXT, closed_date TEXT,
     entry_price {REAL}, exit_price {REAL}, ret {REAL}, excess_ret {REAL}, sector_excess_ret {REAL},
-    decision_id TEXT, exit_decision_id TEXT, tags TEXT);
+    decision_id TEXT, exit_decision_id TEXT, tags TEXT,
+    side TEXT NOT NULL DEFAULT 'long', kind TEXT NOT NULL DEFAULT 'stock');
 CREATE TABLE IF NOT EXISTS nav (
     portfolio_id TEXT NOT NULL DEFAULT 'core', date TEXT NOT NULL, nav {REAL}, cash {REAL}, invested {REAL},
     ret {REAL}, spy_ret {REAL}, rf_ret {REAL}, turnover {REAL},
@@ -135,7 +141,9 @@ class DB:
             ("symbols", "asset_class", "TEXT"),
             ("symbols", "industry", "TEXT"),
             ("symbols", "benchmark", "TEXT"),
-            *[(t, "portfolio_id", "TEXT NOT NULL DEFAULT 'core'") for t in ("orders", "closed_positions", "postmortems", "case_studies")],
+            *[(t, "portfolio_id", "TEXT NOT NULL DEFAULT 'core'") for t in ("orders", "closed_positions", "postmortems", "case_studies", "decisions")],
+            ("decisions", "view_id", "TEXT"),
+            *[(t, c, f"TEXT NOT NULL DEFAULT '{d}'") for t in ("positions", "closed_positions") for c, d in (("side", "long"), ("kind", "stock"))],
         ]
         for table, col, typ in added:
             have = {c["name"] for c in inspect(self.engine).get_columns(table)}

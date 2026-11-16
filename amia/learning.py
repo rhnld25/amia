@@ -31,7 +31,11 @@ def _record(db: DB, decision_id: str | None) -> dict[str, Any]:
     if not decision_id:
         return {}
     v = db.scalar("SELECT record FROM decisions WHERE decision_id = :i", {"i": decision_id})
-    return json.loads(v) if v else {}
+    rec = json.loads(v) if v else {}
+    if rec.get("view_id"):  # v3: the thesis and inputs live on the shared view
+        view = db.scalar("SELECT record FROM views WHERE view_id = :i", {"i": rec["view_id"]})
+        rec = {**(json.loads(view) if view else {}), **rec}
+    return rec
 
 
 def _news_since(db: DB, symbol: str, start: str, end: str) -> list[dict[str, Any]]:
@@ -53,16 +57,25 @@ def _features_brief(f: dict[str, Any] | None) -> dict[str, Any] | None:
 
 def collect_cases(db: DB, panel: ReturnPanel, month_start: str, as_of: str, sector_etf: dict[str, str]) -> list[dict[str, Any]]:
     done = {r["id"] for r in db.query("SELECT id FROM postmortems")}
+    # several portfolios can act on one view: a trade (stock, side, entry day) gets one post-mortem, so one
+    # decision never counts as several agreeing cases toward a lesson
+    closed_rows = db.query("SELECT * FROM closed_positions WHERE kind = 'stock' ORDER BY portfolio_id <> :c, id", {"c": CORE})
+    trade = {f"closed:{p['id']}": (p["symbol"], p["opened_date"], p["side"]) for p in closed_rows}
+    seen = {trade[i] for i in done if i in trade}
     cases = []
-    for p in db.query("SELECT * FROM closed_positions WHERE closed_date >= :a AND closed_date <= :b", {"a": month_start, "b": as_of}):
-        cid = f"closed:{p['id']}"
-        if cid in done:
+    for p in closed_rows:
+        if not month_start <= p["closed_date"] <= as_of:
             continue
+        cid = f"closed:{p['id']}"
+        if cid in done or trade[cid] in seen:
+            continue
+        seen.add(trade[cid])
         etf = sector_etf.get(p["sector"] or "")
         cases.append(
             {
                 "id": cid,
                 "case_type": "closed_position",
+                "side": p["side"],
                 "symbol": p["symbol"],
                 "sector": p["sector"],
                 "decision_id": p["decision_id"],
@@ -73,8 +86,8 @@ def collect_cases(db: DB, panel: ReturnPanel, month_start: str, as_of: str, sect
                     "closed": p["closed_date"],
                     "return": round(p["ret"], 4),
                     "excess_vs_spy": round(p["excess_ret"], 4) if p["excess_ret"] is not None else None,
-                    "excess_vs_sector_etf": round(p["sector_excess_ret"], 4) if p["sector_excess_ret"] is not None else None,
-                    "sector_etf": etf,
+                    "excess_vs_benchmark_etf": round(p["sector_excess_ret"], 4) if p["sector_excess_ret"] is not None else None,
+                    "benchmark_etf": db.scalar("SELECT benchmark FROM symbols WHERE symbol = :s", {"s": p["symbol"]}) or etf,
                     "tags": json.loads(p["tags"] or "[]"),
                 },
                 "features_at_open": _features_brief(_feature(db, p["symbol"], p["opened_date"])),
@@ -83,20 +96,42 @@ def collect_cases(db: DB, panel: ReturnPanel, month_start: str, as_of: str, sect
                 "news_since_open": _news_since(db, p["symbol"], p["opened_date"], p["closed_date"]),
             }
         )
-    h = EVALUATION["decision_horizon"]
-    for d in db.query("SELECT decision_id, date, symbol FROM decisions WHERE action = 'ACCUMULATE' AND executed = 1"):
-        resolved_on = panel.date_after(d["date"], h)
-        if not resolved_on or not month_start <= resolved_on <= as_of:
+    # entries whose horizon resolved on the wrong side: v3 views are judged against their benchmark over the decision
+    # horizon (once per view, whichever portfolios acted on it); v2.2 buys against SPY over 126 trading days
+    entries = db.query(
+        "SELECT decision_id, view_id, date, symbol, action FROM decisions WHERE action IN ('ACCUMULATE', 'SHORT') AND executed = 1 "
+        "ORDER BY portfolio_id <> :c, decision_id",
+        {"c": CORE},
+    )
+    seen_views: set[tuple] = set()
+    for d in entries:
+        key = (d["view_id"] or d["decision_id"], d["action"])
+        if key in seen_views:
             continue
-        cid = f"missed:{d['decision_id']}"
-        ex = panel.excess_vs_spy(d["symbol"], d["date"], h)
-        if cid in done or ex is None or ex >= 0:
+        seen_views.add(key)
+        if d["view_id"]:
+            h = EVALUATION["decision_horizon"]
+            bench = db.scalar("SELECT benchmark FROM views WHERE view_id = :v", {"v": d["view_id"]}) or "SPY"
+            cid, case_type = f"missed:{d['view_id']}:{d['action']}", "missed_target"
+        else:
+            h, bench = 126, "SPY"
+            cid, case_type = f"missed:{d['decision_id']}", "missed_six_month_target"
+        resolved_on = panel.date_after(d["date"], h)
+        if cid in done or not resolved_on or not month_start <= resolved_on <= as_of:
+            continue
+        a, m = panel.forward(d["symbol"], d["date"], h), panel.forward(bench, d["date"], h)
+        if a is None or m is None:
+            continue
+        sign = -1 if d["action"] == "SHORT" else 1
+        ex = sign * (a - m)
+        if ex >= 0:
             continue
         rec = _record(db, d["decision_id"])
         cases.append(
             {
                 "id": cid,
-                "case_type": "missed_six_month_target",
+                "case_type": case_type,
+                "side": "short" if sign < 0 else "long",
                 "symbol": d["symbol"],
                 "sector": rec.get("sector"),
                 "decision_id": d["decision_id"],
@@ -104,8 +139,10 @@ def collect_cases(db: DB, panel: ReturnPanel, month_start: str, as_of: str, sect
                 "outcome": {
                     "decided": d["date"],
                     "resolved": resolved_on,
-                    "return": round(panel.forward(d["symbol"], d["date"], h) or 0, 4),
-                    "excess_vs_spy": round(ex, 4),
+                    "stock_return": round(a, 4),
+                    "benchmark_etf": bench,
+                    "benchmark_return": round(m, 4),
+                    "excess_for_the_side_taken": round(ex, 4),
                     "tags": [],
                 },
                 "features_at_open": _features_brief(_feature(db, d["symbol"], d["date"])),
@@ -146,7 +183,7 @@ def run_postmortems(db: DB, llm: LLM, panel: ReturnPanel, as_of: str, sector_etf
                     "adjustment": pm["adjustment"],
                     "explanation": pm["explanation"],
                     "lesson": pm["lesson"],
-                    "excess_ret": case["outcome"].get("excess_vs_spy"),
+                    "excess_ret": case["outcome"].get("excess_vs_spy", case["outcome"].get("excess_for_the_side_taken")),
                     "record": json.dumps({"case": case, "postmortem": pm}, default=str),
                     "created_at": _now(),
                 }
