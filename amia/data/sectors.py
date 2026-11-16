@@ -5,6 +5,16 @@ which has its own exposure cap."""
 
 from __future__ import annotations
 
+import re
+
+from ..config import (
+    INDUSTRIES,
+    INDUSTRY_ETFS,
+    INDUSTRY_OVERRIDES,
+    KNOWN_ETFS,
+    SECTOR_ETFS,
+)
+
 # (first SIC, last SIC, sector); the first matching range wins, so specific ranges come first
 _RANGES = [
     (1311, 1389, "Energy"),
@@ -69,3 +79,45 @@ def sector_for_sic(sic: str | int | None) -> str:
         if lo <= code <= hi:
             return sector
     return "Unknown"
+
+
+def industry_for(symbol: str, sic: str | int | None) -> str | None:
+    """The industry a company trades as, or None when no listed industry fits (it then uses its sector ETF)."""
+    if symbol in INDUSTRY_OVERRIDES:
+        return INDUSTRY_OVERRIDES[symbol]
+    try:
+        code = int(sic)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    for name, d in INDUSTRIES.items():
+        if any(lo <= code <= hi for lo, hi in d["sic"]):
+            return name
+    return None
+
+
+_FUND_FORMS = {"N-CEN", "N-PORT", "NPORT-P", "N-CSR", "N-CSRS", "485BPOS", "485APOS", "N-1A", "24F-2NT", "N-30D"}
+_FOREIGN_FORMS = {"20-F", "40-F", "6-K", "20-F/A", "40-F/A"}
+_DOMESTIC_FORMS = {"10-K", "10-Q", "10-K/A", "10-Q/A"}
+
+
+def asset_class_for(symbol: str, name: str | None, sic: str | int | None, forms: set[str] | None, has_cik: bool) -> str:
+    """us_equity, adr, etf, crypto or other, from the symbol, the SEC profile and the forms the filer recently filed."""
+    if "/" in symbol:
+        return "crypto"  # Alpaca crypto pairs look like BTC/USD
+    forms = forms or set()
+    if symbol in KNOWN_ETFS or forms & _FUND_FORMS or str(sic) == "6221" or re.search(r"\b(ETF|FUND)\b", (name or "").upper()):
+        return "etf"
+    if not has_cik:
+        return "other"
+    if forms & _FOREIGN_FORMS and not forms & _DOMESTIC_FORMS:
+        return "adr"
+    return "us_equity"
+
+
+def benchmark_for(asset_class: str, sector: str | None, industry: str | None) -> str:
+    """The ETF an instrument is measured against: its industry ETF, else its sector ETF, else SPY."""
+    if asset_class in ("etf", "crypto", "other"):
+        return "SPY"
+    if industry and industry in INDUSTRY_ETFS:
+        return INDUSTRY_ETFS[industry]
+    return SECTOR_ETFS.get(sector or "", "SPY")

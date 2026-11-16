@@ -154,7 +154,61 @@ SECTOR_ETFS = {
     "Real Estate": "XLRE",
     "Communication Services": "XLC",
 }
-BENCHMARKS = ["SPY", *SECTOR_ETFS.values()]
+
+# Industries: one level below sector ("chip stocks", "oil producers"). Derived from the SEC SIC code, since GICS is
+# licensed. Only industries with a clear SIC match and a liquid benchmark ETF are listed; every other company has no
+# industry and is benchmarked against its sector ETF. Ranges are matched in order, first match wins.
+INDUSTRIES: dict[str, dict] = {
+    "Semiconductors": {"sic": [(3674, 3674)], "benchmark": "SMH"},
+    "Software": {"sic": [(7372, 7372)], "benchmark": "IGV"},
+    "Internet": {"sic": [(7370, 7370), (5961, 5961)], "benchmark": "FDN"},
+    "Oil & Gas E&P": {"sic": [(1311, 1311)], "benchmark": "XOP"},
+    "Oil Services": {"sic": [(1381, 1389)], "benchmark": "OIH"},
+    "Refining": {"sic": [(2911, 2911)], "benchmark": "XLE"},
+    "Banks": {"sic": [(6021, 6022)], "benchmark": "KBE"},
+    "Insurance": {"sic": [(6311, 6411)], "benchmark": "KIE"},
+    "Biotech": {"sic": [(2836, 2836)], "benchmark": "XBI"},
+    "Pharma": {"sic": [(2833, 2835)], "benchmark": "PPH"},
+    "Medical Devices": {"sic": [(3841, 3845)], "benchmark": "IHI"},
+    "Aerospace & Defense": {"sic": [(3720, 3729), (3760, 3769)], "benchmark": "ITA"},
+    "Retail": {"sic": [(5311, 5399), (5600, 5736), (5900, 5911), (5913, 5960), (5962, 5999)], "benchmark": "XRT"},
+    "Homebuilders": {"sic": [(1531, 1531)], "benchmark": "ITB"},
+    "Gold Mining": {"sic": [(1040, 1040)], "benchmark": "GDX"},
+    "Metals & Mining": {"sic": [(1000, 1039), (1041, 1099)], "benchmark": "XME"},
+    "Airlines": {"sic": [(4512, 4512)], "benchmark": "JETS"},
+}
+# Companies whose SIC code puts them outside the industry they are traded and benchmarked as.
+INDUSTRY_OVERRIDES = {
+    "LRCX": "Semiconductors",  # SIC 3559, special industry machinery
+    "KLAC": "Semiconductors",  # SIC 3827, optical instruments
+    "ASML": "Semiconductors",
+    "TER": "Semiconductors",
+    "ENTG": "Semiconductors",
+    "MKSI": "Semiconductors",
+}
+INDUSTRY_ETFS = {name: d["benchmark"] for name, d in INDUSTRIES.items()}
+
+# Asset classes. Funds that file like companies (commodity pools, bitcoin trusts) are caught by name or by this list.
+ASSET_CLASSES = ["us_equity", "adr", "etf", "crypto", "other"]
+KNOWN_ETFS = {"SPY", "QQQ", "IWM", "DIA", "GLD", "SLV", "USO", "UNG", "FXI", "IBIT", "FBTC", "TLT", "HYG", "EEM", "EFA"}
+
+BENCHMARKS = ["SPY", *SECTOR_ETFS.values(), *sorted({e for e in INDUSTRY_ETFS.values() if e not in SECTOR_ETFS.values()})]
+
+# Universes and portfolios (AMIA_spec_v3_draft.md). A universe is a filter on the instrument catalog; a portfolio
+# trades one universe with one strategy and keeps its own book. Phase 1 runs only `core`, today's portfolio.
+UNIVERSES = {
+    "us_all": {"classes": ["us_equity"]},
+    "chips": {"classes": ["us_equity", "adr"], "industries": ["Semiconductors"]},
+    "energy": {"classes": ["us_equity", "adr"], "sectors": ["Energy"]},
+    "etfs": {"classes": ["etf"]},
+    "crypto": {"classes": ["crypto"]},
+    "global_mix": {"classes": ["us_equity", "adr", "etf"]},
+}
+STRATEGIES = ["long_only", "long_short", "long_hedge", "long_short_hedge"]
+CORE = "core"
+PORTFOLIOS = {
+    CORE: {"name": "Core", "universe": "us_all", "strategy": "long_only", "hedge": None, "started": "2026-11-03"},
+}
 
 
 def _git_sha() -> str:

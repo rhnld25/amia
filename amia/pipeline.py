@@ -20,6 +20,7 @@ from . import casestudies, evaluation, learning, retention, risk, stats
 from .alerts import Alerter
 from .config import (
     BENCHMARKS,
+    CORE,
     DECISION,
     DISCOVERY,
     EVALUATION,
@@ -32,13 +33,13 @@ from .config import (
     Settings,
 )
 from .data import Providers, get_providers
-from .data.sectors import sector_for_sic
+from .data.sectors import asset_class_for, benchmark_for, industry_for, sector_for_sic
 from .db import DB
 from .decision import grounding_check, validate_decision
 from .discovery import attention_table, build_watchlist, keep_news
 from .frameworks import buffett, graham, marks
 from .llm import DECISION_PROMPT_VERSION, LLM, PRINCIPLES_VERSION, RUBRIC_VERSION, BudgetExceeded
-from .portfolio import metrics, positions, run_day
+from .portfolio import metrics, positions, run_day, sync_portfolios
 from .snapshots import save_snapshot
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ class Pipeline:
         self.s = settings
         self.db = db or DB(settings.database_url)
         self.db.init_schema()
+        sync_portfolios(self.db)
         self.p = providers or get_providers(settings)
         self.llm = LLM(settings, self.db)
         self.alerts = Alerter(settings)
@@ -96,25 +98,56 @@ class Pipeline:
                 self.alerts.alert("SEC ticker map refresh failed", f"{e}. Using the stored map.")
         return {r["key"]: r for r in self.db.query("SELECT * FROM tickers")}
 
-    def ensure_profiles(self, symbols: list[str], tmap: dict[str, dict[str, Any]], as_of: str) -> dict[str, dict[str, Any]]:
+    def ensure_profiles(
+        self, symbols: list[str], tmap: dict[str, dict[str, Any]], as_of: str, classify_limit: int = 100
+    ) -> dict[str, dict[str, Any]]:
+        """Profile rows for `symbols`, creating any that are new. Each row carries the asset class, industry and
+        benchmark ETF. Rows made before v3 have none, and up to `classify_limit` of them are classified per call."""
         known = {r["symbol"]: r for r in self.db.query("SELECT * FROM symbols")}
-        new = []
+        new, classified = [], []
         for s in symbols:
             if s in known:
+                row = known[s]
+                if row.get("asset_class") is None and len(classified) < classify_limit:
+                    forms = None
+                    if row.get("cik"):
+                        try:
+                            forms = set(self.p.company_profile(row["cik"]).get("forms") or [])
+                        except Exception as e:
+                            log.warning("profile %s failed: %s", s, e)
+                            continue
+                    classified.append(self._classify(row, forms))
                 continue
             t = tmap.get(_key(s))
             row = {"symbol": s, "cik": None, "name": None, "sector": "Unknown", "sic": None, "first_seen": as_of, "filings_checked": None, "no_price_since": None}
+            forms = None
             if t:
                 row.update(cik=t["cik"], name=t["title"])
                 try:
                     prof = self.p.company_profile(t["cik"])
                     row.update(name=prof.get("name") or t["title"], sic=prof.get("sic"), sector=sector_for_sic(prof.get("sic")))
+                    forms = set(prof.get("forms") or [])
                 except Exception as e:
                     log.warning("profile %s failed: %s", s, e)
-            new.append(row)
-            known[s] = row
+            new.append(self._classify(row, forms))
+            known[s] = new[-1]
         self.db.upsert("symbols", new, ["symbol"])
+        if classified:
+            self.db.executemany(
+                "UPDATE symbols SET asset_class = :asset_class, industry = :industry, benchmark = :benchmark WHERE symbol = :symbol",
+                [{k: r[k] for k in ("symbol", "asset_class", "industry", "benchmark")} for r in classified],
+            )
+            for r in classified:
+                known[r["symbol"]] = r
         return {s: known[s] for s in symbols if s in known}
+
+    @staticmethod
+    def _classify(row: dict[str, Any], forms: set[str] | None) -> dict[str, Any]:
+        """Asset class, industry and benchmark ETF for a symbols row. Forms are the filer's recent SEC forms, or
+        None when they could not be fetched."""
+        ac = asset_class_for(row["symbol"], row.get("name"), row.get("sic"), forms, bool(row.get("cik")))
+        industry = industry_for(row["symbol"], row.get("sic")) if ac in ("us_equity", "adr") else None
+        return {**row, "asset_class": ac, "industry": industry, "benchmark": benchmark_for(ac, row.get("sector"), industry)}
 
     # ----------------------------------------------------------------- data
     def update_prices(self, symbols: list[str], as_of: str) -> None:
@@ -493,7 +526,7 @@ class Pipeline:
             size_of.setdefault(s, "small")
         rf = (macro.get("DTB3") or [(None, 0.0)])[-1][1]
         sector_of = {r["symbol"]: r["sector"] for r in self.db.query("SELECT symbol, sector FROM symbols")}
-        port = run_day(self.db, as_of, today, prev_close, size_of, sector_of, today.get("SPY", {}).get("ret"), rf)
+        port = run_day(self.db, as_of, today, prev_close, size_of, sector_of, today.get("SPY", {}).get("ret"), rf, pid=CORE)
         self.notes.extend(port.get("events", []))
 
         if halt:
@@ -751,8 +784,8 @@ class Pipeline:
 
     def decide(self, as_of, wl, ctx, market, macro, excluded: set[str]) -> list[str]:
         held = positions(self.db)
-        nav = float(self.db.scalar("SELECT nav FROM nav WHERE date = :d", {"d": as_of}))
-        pending = {r["symbol"] for r in self.db.query("SELECT symbol FROM orders WHERE status = 'pending'")}
+        nav = float(self.db.scalar("SELECT nav FROM nav WHERE portfolio_id = :p AND date = :d", {"p": CORE, "d": as_of}))
+        pending = {r["symbol"] for r in self.db.query("SELECT symbol FROM orders WHERE portfolio_id = :p AND status = 'pending'", {"p": CORE})}
         rets = self._returns(list(held) + list(ctx) + ["SPY"], as_of)
         spy = rets.get("SPY", {})
         state = risk.PortfolioState(
@@ -884,7 +917,7 @@ class Pipeline:
                 )
                 order_rows.append(
                     {
-                        "order_id": decision_id, "decision_id": decision_id, "symbol": s, "side": "SELL", "target_weight": 0.0,
+                        "order_id": decision_id, "portfolio_id": CORE, "decision_id": decision_id, "symbol": s, "side": "SELL", "target_weight": 0.0,
                         "created_date": as_of, "status": "pending", "fill_date": None, "fill_price": None, "amount": None,
                     }
                 )
@@ -977,6 +1010,7 @@ class Pipeline:
                 order_rows.append(
                     {
                         "order_id": decision_id,
+                        "portfolio_id": CORE,
                         "decision_id": decision_id,
                         "symbol": s,
                         "side": "BUY" if a["action"] == "ACCUMULATE" else "SELL",
@@ -1013,7 +1047,7 @@ class Pipeline:
         size = self.db.size_mb()
         if size is not None and size > self.s.db_size_alert_mb:
             self.alerts.alert("Database size warning", f"Database is {size:.0f} MB (free tier limit 500 MB).")
-        navs = [r["ret"] for r in self.db.query("SELECT ret FROM nav ORDER BY date DESC LIMIT 61")]
+        navs = [r["ret"] for r in self.db.query("SELECT ret FROM nav WHERE portfolio_id = :p ORDER BY date DESC LIMIT 61", {"p": CORE})]
         if len(navs) >= 30:
             sd = stats.stdev(navs[1:])
             if sd and abs(navs[0]) > 3 * sd:

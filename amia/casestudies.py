@@ -20,7 +20,7 @@ from .config import CASE_STUDIES
 from .db import DB
 from .decision import grounding_check
 from .evaluation import ReturnPanel, _feature, _regime
-from .learning import _features_brief, _news_since, _record
+from .learning import _features_brief, _news_since, _portfolio_of, _record
 from .llm import LLM, BudgetExceeded
 from .snapshots import load_snapshot
 
@@ -128,6 +128,7 @@ def write_case_studies(db: DB, llm: LLM, panel: ReturnPanel, as_of: str, sector_
             [
                 {
                     "id": case["id"],
+                    "portfolio_id": _portfolio_of(db, case["id"]),
                     "checkpoint": case["checkpoint"],
                     "symbol": case["symbol"],
                     "sector": case.get("sector") or "Unknown",
@@ -149,3 +150,4 @@ def write_case_studies(db: DB, llm: LLM, panel: ReturnPanel, as_of: str, sector_
         n += 1
     notes.append(f"case studies: {n} of {len(cases)} winning buys written up")
     return n
+

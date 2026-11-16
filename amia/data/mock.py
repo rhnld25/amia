@@ -96,7 +96,7 @@ class MockProviders:
 
     def company_profile(self, cik: str) -> dict[str, Any]:
         c = _BY_CIK[cik]
-        return {"name": c["name"], "sic": SECTOR_SIC[c["sector"]], "sic_description": c["sector"]}
+        return {"name": c["name"], "sic": SECTOR_SIC[c["sector"]], "sic_description": c["sector"], "forms": ["10-K", "10-Q"]}
 
     def daily_bars(self, symbols: list[str], start: str, end: str) -> dict[str, list[dict[str, Any]]]:
         s, e = date.fromisoformat(start[:10]), date.fromisoformat(end[:10])

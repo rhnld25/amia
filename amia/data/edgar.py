@@ -148,7 +148,8 @@ class Edgar:
 
     def company_profile(self, cik: str) -> dict[str, Any]:
         d = self.submissions(cik)
-        return {"name": d.get("name"), "sic": d.get("sic"), "sic_description": d.get("sicDescription")}
+        forms = set(((d.get("filings") or {}).get("recent") or {}).get("form") or [])
+        return {"name": d.get("name"), "sic": d.get("sic"), "sic_description": d.get("sicDescription"), "forms": sorted(forms)}
 
     def ticker_map(self) -> dict[str, dict[str, Any]]:
         data = self.http.json("https://www.sec.gov/files/company_tickers.json")

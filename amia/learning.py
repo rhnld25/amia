@@ -15,7 +15,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
-from .config import EVALUATION, LEARNING
+from .config import CORE, EVALUATION, LEARNING
 from .db import DB
 from .evaluation import ReturnPanel, _feature, _regime
 from .llm import LLM, BudgetExceeded
@@ -135,6 +135,7 @@ def run_postmortems(db: DB, llm: LLM, panel: ReturnPanel, as_of: str, sector_etf
             [
                 {
                     "id": case["id"],
+                    "portfolio_id": _portfolio_of(db, case["id"]),
                     "month": as_of[:7],
                     "case_type": case["case_type"],
                     "symbol": case["symbol"],
@@ -204,3 +205,12 @@ def lessons_for(db: DB, sector: str) -> list[str]:
         {"s": sector},
     )
     return [f"[{r['sector']} | {r['lens']} {r['adjustment'].replace('_', ' ')} | {r['n_cases']} post-mortems] {r['guidance']}" for r in rows]
+
+
+def _portfolio_of(db: DB, case_id: str) -> str:
+    """The book a case belongs to: the closed position's portfolio, else `core` (decisions are core's until v3 phase 2)."""
+    if case_id.startswith("closed:"):
+        pid = db.scalar("SELECT portfolio_id FROM closed_positions WHERE id = :i", {"i": case_id[len("closed:"):]})
+        if pid:
+            return pid
+    return CORE
