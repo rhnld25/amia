@@ -6,7 +6,7 @@ from amia import stats
 from amia.data.edgar import extract_facts, extract_section
 from amia.data.sectors import sector_for_sic
 from amia.db import DB
-from amia.decision import extract_numbers, fake_decision, grounding_check, validate_decision
+from amia.decision import extract_numbers, fake_position, fake_view, grounding_check, validate_position, validate_view
 from amia.discovery import attention_table, build_watchlist, keep_news
 from amia.frameworks import buffett, graham, marks
 from amia.learning import lessons_for, update_lessons
@@ -142,37 +142,47 @@ def test_share_classes_take_one_watchlist_slot():
     wl = build_watchlist(t, {"GOOG"}, company=cik, dollar_volume=dv)
     assert [(w["symbol"], w["held"]) for w in wl] == [("AAPL", 0), ("GOOGL", 0), ("GOOG", 1)]
 
-def _dossier(held=None):
+def _dossier():
     return {
-        "ticker": "XYZ", "sector": "Energy", "held": held,
+        "ticker": "XYZ", "sector": "Energy",
         "graham": {"mos_band_low": 0.3125, "criteria_passed": 6, "criteria_total": 8},
         "buffett": {"criteria_passed": 4, "criteria_total": 5},
         "attention": {"attention": 3.217, "avg_sentiment": 3.4},
         "marks": {"stock": {"score": -1, "label": "fear"}, "market": {"temperature": "neutral"}},
-        "risk_overlay": {"required_confidence": 0.6}, "lessons": [],
+        "lessons": [],
     }
 
 
-def test_fake_decision_is_grounded_and_legal():
-    for held in (None, {"weight": 0.03}):
-        ds = _dossier(held)
-        d, problems = validate_decision(fake_decision(ds), "XYZ", held is not None)
-        assert not problems, problems
-        ok, bad = grounding_check(d["thesis"], [ds, d["confidence"], d["target_allocation"]])
-        assert ok, bad
-    assert fake_decision(_dossier())["action"] == "ACCUMULATE"
+def test_fake_view_is_grounded_and_legal():
+    ds = _dossier()
+    v, problems = validate_view(fake_view(ds), "XYZ")
+    assert not problems, problems
+    ok, bad = grounding_check(v["thesis"] + v["counter_case"], [ds, v["p_outperform"], v["target_allocation"]])
+    assert ok, bad
+    assert v["p_outperform"] >= 0.6  # cheap, quality, upbeat news, fear: a long view
+    bear = {**ds, "graham": {"mos_band_low": -0.5, "criteria_passed": 1, "criteria_total": 8}, "buffett": {"criteria_passed": 0, "criteria_total": 5},
+            "attention": {"attention": 3.217, "avg_sentiment": 1.0}, "marks": {"stock": {"score": 2, "label": "greed"}, "market": {"temperature": "hot"}}}
+    assert fake_view(bear)["p_outperform"] <= 0.3  # expensive, weak, gloomy news, greed: a short view
 
 
-def test_validate_decision_rules():
-    base = {"action": "ACCUMULATE", "confidence": 0.7, "target_allocation": 9, "thesis": ["a"]}
-    d, problems = validate_decision(base, "XYZ", held=False)
-    assert not problems and d["target_allocation"] == 0.05  # 9 read as 9%, clipped to the 5% cap
-    _, problems = validate_decision(base, "XYZ", held=True)
-    assert problems  # a held name can only be held or exited
-    _, problems = validate_decision({**base, "confidence": 1.4}, "XYZ", held=False)
-    assert problems
-    d, _ = validate_decision({**base, "action": "PASS"}, "XYZ", held=False)
-    assert d["target_allocation"] == 0.0
+def test_validate_view_rules():
+    base = {"p_outperform": 0.7, "target_allocation": 9, "thesis": ["a"], "counter_case": ["b"]}
+    v, problems = validate_view(base, "XYZ")
+    assert not problems and v["target_allocation"] == 0.05  # 9 read as 9%, clipped to the 5% cap
+    assert validate_view({**base, "p_outperform": 1.4}, "XYZ")[1]
+    assert validate_view({**base, "counter_case": []}, "XYZ")[1]  # a view must name the case against it
+
+
+def test_position_calls():
+    ok = {"action": "HOLD", "target_allocation": 0.02, "reason": ["still cheap"]}
+    assert not validate_position(ok, "XYZ", "long", 0.05)[1]
+    assert validate_position({**ok, "action": "COVER"}, "XYZ", "long", 0.05)[1]  # a long is exited, not covered
+    assert validate_position({**ok, "action": "EXIT"}, "XYZ", "short", 0.03)[1]
+    a, _ = validate_position({**ok, "target_allocation": 0.2}, "XYZ", "short", 0.03)
+    assert a["target_allocation"] == 0.03
+    case = {"view": {"p_outperform": 0.7}, "position": {"ticker": "XYZ", "side": "short", "weight": 0.02}}
+    assert fake_position(case)["action"] == "COVER"  # the view turned against the short
+    assert fake_position({**case, "position": {**case["position"], "side": "long"}})["action"] == "HOLD"
 
 
 def test_lessons_need_agreement(tmp_path):

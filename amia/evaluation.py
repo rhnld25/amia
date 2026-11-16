@@ -93,17 +93,16 @@ def ic_summary(db: DB) -> dict[str, dict[int, dict[str, Any]]]:
 
 
 def decision_brier(db: DB, panel: ReturnPanel) -> dict[str, Any]:
-    """Is the model's confidence (P(beat SPY over the decision horizon)) calibrated? Uses every review."""
+    """Is the view's probability calibrated? v3 views give P(beat its benchmark ETF over the decision horizon);
+    every view counts once, however many portfolios acted on it."""
     h = EVALUATION["decision_horizon"]
-    probs, outcomes, buys = [], [], []
-    for d in db.query("SELECT date, symbol, action, confidence FROM decisions WHERE confidence IS NOT NULL"):
-        ex = panel.excess_vs_spy(d["symbol"], d["date"], h)
-        if ex is None:
+    probs, outcomes = [], []
+    for v in db.query("SELECT date, symbol, benchmark, p FROM views WHERE p IS NOT NULL"):
+        a, m = panel.forward(v["symbol"], v["date"], h), panel.forward(v["benchmark"] or "SPY", v["date"], h)
+        if a is None or m is None:
             continue
-        probs.append(d["confidence"])
-        outcomes.append(1 if ex > 0 else 0)
-        if d["action"] == "ACCUMULATE":
-            buys.append(1 if ex > 0 else 0)
+        probs.append(v["p"])
+        outcomes.append(1 if a > m else 0)
     if not probs:
         return {"resolved": 0}
     base = stats.mean(outcomes)
@@ -111,9 +110,7 @@ def decision_brier(db: DB, panel: ReturnPanel) -> dict[str, Any]:
         "resolved": len(probs),
         "brier": stats.brier(probs, outcomes),
         "brier_base_rate": stats.brier([base] * len(outcomes), outcomes),
-        "beat_spy_rate": base,
-        "accumulate_hit_rate": stats.mean(buys) if buys else None,
-        "accumulate_resolved": len(buys),
+        "beat_benchmark_rate": base,
     }
 
 
@@ -129,18 +126,28 @@ def _regime(db: DB, date: str) -> int | None:
 
 
 def tag_closed_positions(db: DB, panel: ReturnPanel, sector_etf: dict[str, str]) -> int:
-    """Deterministic attribution tags for closed positions that have none yet. Evidence for the post-mortem."""
+    """Deterministic attribution tags for closed positions that have none yet. Evidence for the post-mortem.
+
+    Returns are the position's own (a short gains when the stock falls), so excess against SPY and against the
+    stock's benchmark ETF are signed the same way: positive means the trade beat simply holding the benchmark
+    on the same side. Hedges are tagged as such and skipped."""
     n = 0
+    bench_of = {r["symbol"]: r["benchmark"] for r in db.query("SELECT symbol, benchmark FROM symbols WHERE benchmark IS NOT NULL")}
     for p in db.query("SELECT * FROM closed_positions WHERE tags IS NULL"):
+        if (p.get("kind") or "stock") == "hedge":
+            db.execute("UPDATE closed_positions SET tags = :t WHERE id = :i", {"t": json.dumps(["hedge"]), "i": p["id"]})
+            continue
+        sign = -1 if p.get("side") == "short" else 1
         tags = []
         spy = panel.between("SPY", p["opened_date"], p["closed_date"])
-        excess = p["ret"] - spy
-        etf = sector_etf.get(p["sector"] or "")
+        excess = p["ret"] - sign * spy
+        etf = bench_of.get(p["symbol"]) or sector_etf.get(p["sector"] or "")
         sector_excess = None
         if etf:
             sec = panel.between(etf, p["opened_date"], p["closed_date"])
-            sector_excess = p["ret"] - sec
-            if excess < 0 and sec - spy < 0 and abs(sec - spy) >= abs(excess) * 0.5:
+            sector_excess = p["ret"] - sign * sec
+            rel = sign * (sec - spy)
+            if excess < 0 and rel < 0 and abs(rel) >= abs(excess) * 0.5:
                 tags.append("sector_drag")
         f_open, f_close = _feature(db, p["symbol"], p["opened_date"]), _feature(db, p["symbol"], p["closed_date"])
         if f_open and f_close:
@@ -158,7 +165,8 @@ def tag_closed_positions(db: DB, panel: ReturnPanel, sector_etf: dict[str, str])
             {"sym": f"%|{p['symbol']}|%", "a": p["opened_date"], "b": p["closed_date"]},
         )
         avg_sent = texts[0]["s"] if texts else None
-        if avg_sent is not None and ((avg_sent > 2.5 and excess < 0) or (avg_sent < 1.5 and excess > 0)):
+        stock_excess = sign * excess  # the stock's own move against SPY, whichever side was held
+        if avg_sent is not None and ((avg_sent > 2.5 and stock_excess < 0) or (avg_sent < 1.5 and stock_excess > 0)):
             tags.append("text_signal_wrong")
         if not tags:
             tags.append("unexplained")
@@ -182,7 +190,11 @@ def consistency_rate(db: DB) -> dict[str, Any]:
 
 
 def grounding_failure_rate(db: DB) -> dict[str, Any]:
-    rows = db.query("SELECT thesis_ok FROM decisions WHERE thesis_ok IS NOT NULL")
+    """Share of model answers whose numbers failed the check: v3 views and position calls, plus v2.2 decisions."""
+    rows = db.query("SELECT thesis_ok FROM views WHERE thesis_ok IS NOT NULL")
+    rows += db.query(
+        "SELECT thesis_ok FROM decisions WHERE thesis_ok IS NOT NULL AND (view_id IS NULL OR action IN ('HOLD', 'EXIT', 'COVER'))"
+    )
     if not rows:
         return {"decisions": 0, "failure_rate": None}
     return {"decisions": len(rows), "failure_rate": sum(1 for r in rows if not r["thesis_ok"]) / len(rows)}

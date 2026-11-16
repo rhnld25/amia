@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import stats
-from .config import DECISION, RISK
+from .config import DECISION, HEDGE, RISK, SHORT
 
 
 def regime_flags(macro: dict[str, list[tuple[str, float]]]) -> list[str]:
@@ -56,15 +56,26 @@ def annual_vol(returns: dict[str, float], window: int = 60) -> float | None:
 @dataclass
 class PortfolioState:
     nav: float
-    weights: dict[str, float]  # symbol -> weight of NAV
+    weights: dict[str, float]  # long stock positions: symbol -> weight of NAV
     sectors: dict[str, str]  # symbol -> sector
     betas: dict[str, float] = field(default_factory=dict)
+    shorts: dict[str, float] = field(default_factory=dict)  # short stock positions: symbol -> weight (positive)
+    hedges: dict[str, float] = field(default_factory=dict)  # ETF hedges: symbol -> short weight (positive)
 
     def sector_weight(self, sector: str) -> float:
         return sum(w for s, w in self.weights.items() if self.sectors.get(s) == sector)
 
+    def short_sector_weight(self, sector: str) -> float:
+        return sum(w for s, w in self.shorts.items() if self.sectors.get(s) == sector)
+
+    def stock_beta(self) -> float:
+        """Market exposure of the stock book: longs minus shorts, before hedges."""
+        return sum(w * self.betas.get(s, 1.0) for s, w in self.weights.items()) - sum(
+            w * self.betas.get(s, 1.0) for s, w in self.shorts.items()
+        )
+
     def beta(self) -> float:
-        return sum(w * self.betas.get(s, 1.0) for s, w in self.weights.items())
+        return self.stock_beta() - sum(w * self.betas.get(s, 1.0) for s, w in self.hedges.items())
 
 
 def required_confidence(sector: str, state: PortfolioState, regime: list[str]) -> tuple[float, list[str]]:
@@ -110,3 +121,56 @@ def check_buy(
         failures.append("correlation limit")
     d["failures"] = failures
     return not failures, d
+
+
+def check_short(
+    symbol: str,
+    sector: str,
+    weight: float,
+    price: float | None,
+    market_cap: float | None,
+    state: PortfolioState,
+    same_company: list[str] | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Hard limits for a new short. Returns (approved, details)."""
+    d: dict[str, Any] = {
+        "position_weight": weight,
+        "short_weight_after": round(sum(state.shorts.values()) + weight, 4),
+        "short_sector_weight_after": round(state.short_sector_weight(sector) + weight, 4),
+        "price": price,
+        "market_cap": market_cap,
+    }
+    failures = []
+    if weight > SHORT["max_position_weight"]:
+        failures.append("short position limit")
+    if d["short_weight_after"] > SHORT["max_total_weight"]:
+        failures.append("total short limit")
+    if d["short_sector_weight_after"] > SHORT["max_sector_weight"]:
+        failures.append("short sector limit")
+    if price is None or price < SHORT["min_price"]:
+        failures.append(f"price below ${SHORT['min_price']:.0f}")
+    if market_cap is None or market_cap < SHORT["min_market_cap"]:
+        failures.append("market cap below $2B or unknown (hard to borrow)")
+    if same_company:
+        d["same_company_held"] = sorted(same_company)
+        failures.append(f"another share class of this company is held ({', '.join(sorted(same_company))})")
+    d["failures"] = failures
+    return not failures, d
+
+
+def hedge_targets(state: PortfolioState, mode: str | None, benchmark_of: dict[str, str]) -> dict[str, float]:
+    """Target short weight per hedge ETF, from the stock book (hedges excluded).
+
+    market: short SPY so the book's beta falls to the target (SPY's beta is 1 by definition).
+    industry: for each benchmark ETF, short the net long weight of the stocks measured against it, so each
+    industry bet is reduced to stock picking."""
+    if mode == "market":
+        return {"SPY": round(max(0.0, state.stock_beta() - HEDGE["market_target_beta"]), 4)}
+    if mode == "industry":
+        net: dict[str, float] = {}
+        for s, w in state.weights.items():
+            net[benchmark_of.get(s) or "SPY"] = net.get(benchmark_of.get(s) or "SPY", 0.0) + w
+        for s, w in state.shorts.items():
+            net[benchmark_of.get(s) or "SPY"] = net.get(benchmark_of.get(s) or "SPY", 0.0) - w
+        return {etf: round(max(0.0, v), 4) for etf, v in net.items()}
+    return {}

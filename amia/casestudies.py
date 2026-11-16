@@ -16,7 +16,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from .config import CASE_STUDIES
+from .config import CASE_STUDIES, CORE
 from .db import DB
 from .decision import grounding_check
 from .evaluation import ReturnPanel, _feature, _regime
@@ -54,15 +54,23 @@ def _case(db: DB, kind: str, cid: str, d: dict[str, Any], rec: dict[str, Any], e
 
 
 def collect_cases(db: DB, panel: ReturnPanel, as_of: str, sector_etf: dict[str, str]) -> list[dict[str, Any]]:
-    """Winning buys not yet written up: beat SPY and the sector ETF by `min_excess` at the checkpoint or on close."""
+    """Winning buys not yet written up: beat SPY and the benchmark ETF by `min_excess` at the checkpoint or on close.
+    One study per view (core's buy when it made one), however many portfolios bought on it. v2.2 buys, made before
+    views existed, are measured against their sector ETF."""
     done = {r["id"] for r in db.query("SELECT id FROM case_studies")}
     margin, h = CASE_STUDIES["min_excess"], CASE_STUDIES["checkpoint_days"]
-    buys = {d["decision_id"]: d for d in db.query("SELECT decision_id, date, symbol FROM decisions WHERE action = 'ACCUMULATE' AND executed = 1")}
+    buys: dict[str, dict[str, Any]] = {}
+    for d in db.query(
+        "SELECT decision_id, view_id, date, symbol FROM decisions WHERE action = 'ACCUMULATE' AND executed = 1 ORDER BY portfolio_id <> :c, decision_id",
+        {"c": CORE},
+    ):
+        buys.setdefault(d["view_id"] or d["decision_id"], d)
     closed = {p["decision_id"]: p for p in db.query("SELECT * FROM closed_positions WHERE closed_date <= :d", {"d": as_of})}
     cases = []
-    for did, d in buys.items():
+    for d in buys.values():
+        did = d["decision_id"]
         rec = _record(db, did)
-        etf = sector_etf.get(rec.get("sector") or "")
+        etf = rec.get("benchmark") or sector_etf.get(rec.get("sector") or "")
         p = closed.get(did)
         cid = f"closed:{p['id']}" if p else None
         if p and cid not in done and (p["excess_ret"] or 0) >= margin and (p["sector_excess_ret"] or 0) >= margin:

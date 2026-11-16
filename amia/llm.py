@@ -30,7 +30,7 @@ log = logging.getLogger(__name__)
 
 RUBRIC_VERSION = "text_scoring_v2"
 PRINCIPLES_VERSION = "principles_v1"
-DECISION_PROMPT_VERSION = "decision_v1"
+DECISION_PROMPT_VERSION = "view_v1+position_v1"
 
 SCORE_SCHEMA = {
     "type": "object",
@@ -45,26 +45,40 @@ SCORE_SCHEMA = {
     "additionalProperties": False,
 }
 
-ACTIONS = ["ACCUMULATE", "HOLD", "EXIT", "PASS"]
+_VIEWS_OBJ = {
+    "type": "object",
+    "properties": {"graham": {"type": "string"}, "buffett": {"type": "string"}, "marks": {"type": "string"}},
+    "required": ["graham", "buffett", "marks"],
+    "additionalProperties": False,
+}
 
-DECISION_SCHEMA = {
+VIEW_SCHEMA = {
     "type": "object",
     "properties": {
         "ticker": {"type": "string"},
-        "action": {"type": "string", "enum": ACTIONS},
+        "p_outperform": {"type": "number"},
         "target_allocation": {"type": "number"},
-        "confidence": {"type": "number"},
         "thesis": {"type": "array", "items": {"type": "string"}},
-        "framework_views": {
-            "type": "object",
-            "properties": {"graham": {"type": "string"}, "buffett": {"type": "string"}, "marks": {"type": "string"}},
-            "required": ["graham", "buffett", "marks"],
-            "additionalProperties": False,
-        },
+        "counter_case": {"type": "array", "items": {"type": "string"}},
+        "framework_views": _VIEWS_OBJ,
         "key_risks": {"type": "array", "items": {"type": "string"}},
         "lessons_applied": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["ticker", "action", "target_allocation", "confidence", "thesis", "framework_views", "key_risks", "lessons_applied"],
+    "required": ["ticker", "p_outperform", "target_allocation", "thesis", "counter_case", "framework_views", "key_risks", "lessons_applied"],
+    "additionalProperties": False,
+}
+
+POSITION_ACTIONS = ["HOLD", "EXIT", "COVER"]
+
+POSITION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "ticker": {"type": "string"},
+        "action": {"type": "string", "enum": POSITION_ACTIONS},
+        "target_allocation": {"type": "number"},
+        "reason": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["ticker", "action", "target_allocation", "reason"],
     "additionalProperties": False,
 }
 
@@ -85,23 +99,25 @@ POSTMORTEM_SCHEMA = {
     "additionalProperties": False,
 }
 
-DECISION_RULES = """You are the reasoning engine of AMIA, a paper-trading research system. For one stock you receive a
+VIEW_RULES = """You are the reasoning engine of AMIA, a paper-trading research system. For one stock you receive a
 DOSSIER: framework math computed in code (Graham value, Buffett quality, Marks cycle), recent news and filing
-scores, market conditions, the paper portfolio, the risk overlay's required confidence, and lessons from past
-post-mortems. Decide what to do with this stock today, reasoning like a disciplined long-term investor who uses
-all three philosophies together. No single framework is a gate: a stock can be worth owning while failing one
-lens, and a stock can pass every screen and still be a poor buy. Weigh them.
+scores, market conditions, the stock's benchmark ETF, and lessons from past post-mortems. Form a VIEW of the
+stock, reasoning like a disciplined investor who uses all three philosophies together. No single framework is a
+gate: a stock can be worth owning while failing one lens, and a stock can pass every screen and still lag.
+Several portfolios act on your view: some can only buy, some can also sell short, some hedge. Code decides what
+each portfolio does with it, so give your honest view, not a trade.
 
 Rules:
-- Actions: if the dossier says the stock is held, choose HOLD or EXIT. If not held, choose ACCUMULATE or PASS.
-- target_allocation is a fraction of the portfolio (0.025 means 2.5%). Between 0.005 and 0.05 for ACCUMULATE;
-  for HOLD, the weight you want it to stay near; 0 for EXIT and PASS.
-- confidence is your probability (0 to 1) that this stock beats SPY over the next 126 trading days, whatever
-  the action. Be calibrated: 0.5 means no edge. ACCUMULATE only makes sense when confidence is at least the
-  dossier's risk_overlay.required_confidence.
-- thesis: exactly 3 bullets, each at most 35 words. Use only numbers that appear in the DOSSIER, written as
-  given there, rounded, or as a percentage of a fraction (0.24 may be written as 24%). Do not mention dates
-  or years. Never invent a figure, ratio or estimate. If data is missing, say so in words.
+- p_outperform is your probability (0 to 1) that this stock's total return beats its benchmark ETF (the
+  dossier's benchmark.etf) over the next 63 trading days. Be calibrated: 0.5 means no edge either way. High
+  values say it should lead its benchmark; low values say it should lag (a candidate to sell short).
+- target_allocation: the position size, as a fraction of a portfolio (0.025 means 2.5%), you would give a
+  position taken on this view, long or short, between 0.005 and 0.05. Use 0 when you see no edge.
+- thesis: exactly 3 bullets, each at most 35 words, making the case for your probability.
+- counter_case: 1 or 2 bullets, each at most 35 words, giving the strongest argument against it.
+- In thesis and counter_case use only numbers that appear in the DOSSIER, written as given there, rounded, or as
+  a percentage of a fraction (0.24 may be written as 24%). Do not mention dates or years. Never invent a figure,
+  ratio or estimate. If data is missing, say so in words.
 - framework_views: one sentence each on what Graham, Buffett and Marks would make of this stock, from the
   principles below and the dossier's numbers.
 - key_risks: up to 3 short phrases. lessons_applied: the lessons from the dossier you relied on, or empty.
@@ -111,10 +127,25 @@ Principles (summaries written for this system):
 
 """
 
-POSTMORTEM_SYSTEM = """You review one paper trade (or one decision whose six-month window has resolved) for AMIA's monthly
-post-mortem. You receive the original decision record with its thesis and inputs, and what happened afterwards:
-returns against SPY and the sector ETF, how the framework numbers changed, how macro conditions changed, the
-news since, and code-computed attribution tags. Decide which cause best explains the outcome:
+POSITION_RULES = """You manage one open position in one of AMIA's paper portfolios. You receive the POSITION (long or short,
+entry, return so far, how long it has been held, its weight), the PORTFOLIO it sits in (strategy and exposures),
+and today's VIEW of the stock: the probability it beats its benchmark ETF over the next 63 trading days, the
+thesis, the counter case and the key risks, written from the full research dossier.
+
+Decide whether this portfolio should keep the position:
+- A long position: HOLD or EXIT. A short position: HOLD or COVER.
+- Keep a position while the reason it was opened still holds and the view still points its way. Close it when
+  the view has turned against it, the thesis is broken, or the risk is no longer worth carrying in this
+  portfolio. A gain or a loss on its own is not a reason either way.
+- target_allocation: for HOLD, the weight you want it to stay near (a fraction, 0.025 means 2.5%); 0 otherwise.
+- reason: 1 or 2 sentences, each at most 35 words. Use only numbers that appear in the input, as given, rounded,
+  or as a percentage of a fraction. Do not mention dates or years. Never invent a figure."""
+
+POSTMORTEM_SYSTEM = """You review one paper trade, long or short (see side), or one entry whose horizon resolved on the wrong
+side, for AMIA's monthly post-mortem. You receive the original record with its thesis and inputs, and what happened
+afterwards: returns against SPY and the stock's benchmark ETF (signed for the side taken, so positive means the
+trade beat the benchmark), how the framework numbers changed, how macro conditions changed, the news since, and
+code-computed attribution tags. Decide which cause best explains the outcome:
 - thesis_played_out: the reasoning held and the result followed (good or bad outcomes can still fit here only if good).
 - math_failed: the framework numbers misled (value trap, quality deteriorated, cyclical peak earnings).
 - sentiment_wrong: the news or sentiment reading was wrong or overweighted.
@@ -374,15 +405,25 @@ class LLM:
             raise RuntimeError(f"{purpose} returned no answer (finish_reason={choice.get('finish_reason')})")
         return _json_text(content)
 
-    def decide(self, dossier: dict[str, Any], feedback: str | None = None) -> dict[str, Any]:
+    def view(self, dossier: dict[str, Any], feedback: str | None = None) -> dict[str, Any]:
         if self.fake:
-            from .decision import fake_decision
+            from .decision import fake_view
 
-            return fake_decision(dossier)
+            return fake_view(dossier)
         user = "DOSSIER:\n" + json.dumps(dossier, sort_keys=True, default=str)
         if feedback:
             user += f"\n\nYOUR PREVIOUS ANSWER WAS REJECTED: {feedback} Answer again following the rules."
-        return self._json_call("decision", DECISION_RULES + principles_text(), user, DECISION_SCHEMA, "medium")
+        return self._json_call("view", VIEW_RULES + principles_text(), user, VIEW_SCHEMA, "medium")
+
+    def position(self, case: dict[str, Any], feedback: str | None = None) -> dict[str, Any]:
+        if self.fake:
+            from .decision import fake_position
+
+            return fake_position(case)
+        user = "CASE:\n" + json.dumps(case, sort_keys=True, default=str)
+        if feedback:
+            user += f"\n\nYOUR PREVIOUS ANSWER WAS REJECTED: {feedback} Answer again following the rules."
+        return self._json_call("position", POSITION_RULES, user, POSITION_SCHEMA, "low")
 
     def postmortem(self, case: dict[str, Any]) -> dict[str, Any]:
         if self.fake:

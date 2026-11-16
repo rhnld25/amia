@@ -187,6 +187,19 @@ Framework version moves to `quantamental@3.0.0`. Records under 2.0.0 stay as the
 - Lessons stay shared across portfolios, since every portfolio reads the same view.
 - Decisions are unchanged: the dossier, the risk sector and the sector-ETF comparisons are exactly as in v2.2. Industry benchmark prices are now fetched daily, so their history accrues before phase 2 starts using them.
 
+**As built in phase 2:**
+- Your answers: the model decides HOLD/EXIT (or HOLD/COVER) for each open position in each portfolio, one short call (`position_v1`, low reasoning effort) whenever the stock gets a fresh view. Every portfolio, core included, uses a 63-trading-day horizon. The view's probability is against the stock's benchmark ETF. Shorts open at `p ≤ 0.30`.
+- The view's second list is `counter_case` (the strongest argument against the call, for longs and shorts alike) rather than `bear_case`. Both lists pass the number-grounding check.
+- `views` holds one row per stock per review. `decisions` now holds one row per portfolio per stock, with `portfolio_id` and `view_id`. Core keeps its old decision-id format.
+- Entries per portfolio come from today's views, strongest conviction first, with at most 3 new positions a day (longs and shorts together) through the risk limits. Code alone closes share-class doubles and short stops.
+- Short stops add a 30-day cooldown before the same portfolio shorts that stock again. The mock run showed a stopped short being reopened the next day.
+- The "no shorting through earnings week" rule is not built: free data has no reliable earnings calendar.
+- Industry hedges are weight-matched (each benchmark's net long weight is shorted 1:1). Market hedges short SPY until the book's beta is 0.3. Hedges rebalance when they drift 0.5% of NAV from target, and a closed hedge records no return of its own.
+- `us_all` is US stocks only, so ETFs (SPY), ADRs (AZN, NVO) and tickers without SEC filings no longer get views. They return with the ETF and ADR universes in phase 4.
+- Post-mortems and case studies count each trade or view once, however many portfolios made it, so one view never becomes several agreeing cases toward a lesson.
+- New portfolios start at $100,000 on their first run after deploy.
+- Price triggers are not built yet. They move to phase 3 with the intraday work.
+
 ## 6. Starter portfolios
 
 | Portfolio | Universe | Strategy |

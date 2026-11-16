@@ -70,42 +70,40 @@ def grounding_check(bullets: list[str], source: Any) -> tuple[bool, list[str]]:
     return not bad, bad
 
 
-def validate_decision(d: dict[str, Any], ticker: str, held: bool) -> tuple[dict[str, Any], list[str]]:
-    """Normalize the model's answer. Returns (decision, problems); problems mean the answer can't be used."""
+def _alloc(v: Any) -> float:
+    try:
+        a = float(v or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return a / 100 if a > 1 else a  # a percentage written as a number (2.5 for 2.5%)
+
+
+def _bullets(v: Any, n: int) -> list[str]:
+    return [str(b).strip() for b in (v or []) if str(b).strip()][:n]
+
+
+def validate_view(d: dict[str, Any], ticker: str) -> tuple[dict[str, Any], list[str]]:
+    """Normalize the model's view of one stock. Returns (view, problems); problems mean it can't be used."""
     problems = []
-    action = d.get("action")
-    if held and action not in ("HOLD", "EXIT"):
-        problems.append(f"{ticker} is held, so the action must be HOLD or EXIT, not {action}")
-    if not held and action not in ("ACCUMULATE", "PASS"):
-        problems.append(f"{ticker} is not held, so the action must be ACCUMULATE or PASS, not {action}")
     try:
-        conf = float(d.get("confidence"))
+        p = float(d.get("p_outperform"))
     except (TypeError, ValueError):
-        conf = float("nan")
-    if not 0 <= conf <= 1:
-        problems.append(f"confidence must be between 0 and 1, got {d.get('confidence')}")
-    try:
-        alloc = float(d.get("target_allocation") or 0)
-    except (TypeError, ValueError):
-        alloc = 0.0
-    if alloc > 1:  # a percentage written as a number (2.5 for 2.5%)
-        alloc /= 100
-    if action == "ACCUMULATE":
-        alloc = min(max(alloc, DECISION["min_position_weight"]), DECISION["max_position_weight"])
-    elif action == "HOLD":
-        alloc = min(max(alloc, 0.0), DECISION["max_position_weight"])
-    else:
-        alloc = 0.0
-    thesis = [str(b).strip() for b in (d.get("thesis") or []) if str(b).strip()][:3]
+        p = float("nan")
+    if not 0 <= p <= 1:
+        problems.append(f"p_outperform must be between 0 and 1, got {d.get('p_outperform')}")
+    alloc = min(max(_alloc(d.get("target_allocation")), 0.0), DECISION["max_position_weight"])
+    thesis, counter = _bullets(d.get("thesis"), 3), _bullets(d.get("counter_case"), 2)
     if not thesis:
         problems.append("thesis is empty")
+    if not counter:
+        problems.append("counter_case is empty")
     views = d.get("framework_views") or {}
     out = {
         "ticker": ticker,
-        "action": action,
+        "p_outperform": round(p, 3) if p == p else None,
         "target_allocation": round(alloc, 4),
-        "confidence": round(conf, 3) if conf == conf else None,
         "thesis": thesis,
+        "counter_case": counter,
         "framework_views": {k: str(views.get(k, ""))[:400] for k in ("graham", "buffett", "marks")},
         "key_risks": [str(r)[:200] for r in (d.get("key_risks") or [])][:3],
         "lessons_applied": [str(r)[:300] for r in (d.get("lessons_applied") or [])][:5],
@@ -113,11 +111,25 @@ def validate_decision(d: dict[str, Any], ticker: str, held: bool) -> tuple[dict[
     return out, problems
 
 
+def validate_position(d: dict[str, Any], ticker: str, side: str, max_weight: float) -> tuple[dict[str, Any], list[str]]:
+    """Normalize the model's call on one open position: HOLD or EXIT for a long, HOLD or COVER for a short."""
+    problems = []
+    action = d.get("action")
+    allowed = ("HOLD", "EXIT") if side == "long" else ("HOLD", "COVER")
+    if action not in allowed:
+        problems.append(f"{ticker} is a {side} position, so the action must be {' or '.join(allowed)}, not {action}")
+    alloc = min(max(_alloc(d.get("target_allocation")), 0.0), max_weight) if action == "HOLD" else 0.0
+    reason = _bullets(d.get("reason"), 2)
+    if not reason:
+        problems.append("reason is empty")
+    return {"ticker": ticker, "action": action, "target_allocation": round(alloc, 4), "reason": reason}, problems
+
+
 def _pct0(v: float) -> str:
     return f"{v * 100:.0f}%"
 
 
-def fake_decision(ds: dict[str, Any]) -> dict[str, Any]:
+def fake_view(ds: dict[str, Any]) -> dict[str, Any]:
     """Deterministic stand-in for the reasoning model in mock runs. Uses only dossier numbers."""
     g, b, att = ds.get("graham") or {}, ds.get("buffett") or {}, ds.get("attention") or {}
     stock = (ds.get("marks") or {}).get("stock") or {}
@@ -125,12 +137,12 @@ def fake_decision(ds: dict[str, Any]) -> dict[str, Any]:
     score, bullets = 0.0, []
     mos = g.get("mos_band_low")
     if mos is not None:
-        score += 1 if mos >= 0.25 else 0.5 if mos >= 0 else -0.5
+        score += 1 if mos >= 0.25 else 0.5 if mos >= 0 else -1
         bullets.append(f"Graham: price {_pct0(mos)} versus the intrinsic value band low, {g.get('criteria_passed')} of {g.get('criteria_total')} defensive criteria met.")
     else:
         bullets.append("Graham: intrinsic value unavailable from the filings provided.")
     if b.get("criteria_passed") is not None:
-        score += 1 if b["criteria_passed"] >= 3 else 0
+        score += 1 if b["criteria_passed"] >= 3 else -0.5 if b["criteria_passed"] <= 1 else 0
         bullets.append(f"Buffett: {b['criteria_passed']} of {b['criteria_total']} quality criteria met.")
     sent = att.get("avg_sentiment")
     if sent is not None:
@@ -143,19 +155,28 @@ def fake_decision(ds: dict[str, Any]) -> dict[str, Any]:
     bullets.append(
         f"News: attention {att.get('attention')} with average sentiment {sent}; Marks pendulum reads {stock.get('label', 'neutral')}."
     )
-    conf = round(min(0.8, max(0.3, 0.45 + 0.07 * score)), 2)
-    required = (ds.get("risk_overlay") or {}).get("required_confidence", DECISION["base_confidence"])
-    if ds.get("held"):
-        action, alloc = ("EXIT", 0.0) if conf < 0.45 else ("HOLD", ds["held"].get("weight", 0.0))
-    else:
-        action, alloc = ("ACCUMULATE", 0.025) if conf >= required else ("PASS", 0.0)
+    p = round(min(0.8, max(0.2, 0.45 + 0.08 * score)), 2)
     return {
         "ticker": ds["ticker"],
-        "action": action,
-        "target_allocation": alloc,
-        "confidence": conf,
+        "p_outperform": p,
+        "target_allocation": 0.025 if abs(p - 0.5) >= 0.1 else 0.0,
         "thesis": bullets[:3],
+        "counter_case": ["Mock counter case: the frameworks can be wrong about this stock."],
         "framework_views": {"graham": "Mock view.", "buffett": "Mock view.", "marks": "Mock view."},
-        "key_risks": ["mock decision"],
+        "key_risks": ["mock view"],
         "lessons_applied": [lesson for lesson in ds.get("lessons") or [] if ds.get("sector", "") in lesson][:1],
+    }
+
+
+def fake_position(case: dict[str, Any]) -> dict[str, Any]:
+    """Mock position call: close when today's view has turned against the position."""
+    p = case["view"]["p_outperform"]
+    side = case["position"]["side"]
+    against = p is not None and ((side == "long" and p < 0.45) or (side == "short" and p > 0.55))
+    action = ("EXIT" if side == "long" else "COVER") if against else "HOLD"
+    return {
+        "ticker": case["position"]["ticker"],
+        "action": action,
+        "target_allocation": 0.0 if against else case["position"]["weight"],
+        "reason": [f"Today's view puts the chance of beating the benchmark at {p}."],
     }
