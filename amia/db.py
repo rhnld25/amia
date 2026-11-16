@@ -6,6 +6,7 @@ Tables are append-mostly. Decisions, snapshots and facts are never updated in pl
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -17,7 +18,7 @@ CREATE TABLE IF NOT EXISTS tickers (
     key TEXT PRIMARY KEY, ticker TEXT, cik TEXT, title TEXT);
 CREATE TABLE IF NOT EXISTS symbols (
     symbol TEXT PRIMARY KEY, cik TEXT, name TEXT, sector TEXT, sic TEXT, first_seen TEXT,
-    filings_checked TEXT, no_price_since TEXT);
+    filings_checked TEXT, no_price_since TEXT, asset_class TEXT, industry TEXT, benchmark TEXT);
 CREATE TABLE IF NOT EXISTS prices (
     symbol TEXT NOT NULL, date TEXT NOT NULL, open {REAL}, close {REAL}, ret {REAL}, volume {REAL},
     PRIMARY KEY (symbol, date));
@@ -67,27 +68,32 @@ CREATE TABLE IF NOT EXISTS decisions (
     decision_id TEXT PRIMARY KEY, as_of TEXT, date TEXT, symbol TEXT, action TEXT, target_weight {REAL},
     confidence {REAL}, record TEXT, snapshot_hash TEXT, resolve_on TEXT, thesis_ok INTEGER, executed INTEGER);
 CREATE INDEX IF NOT EXISTS decisions_symbol ON decisions (symbol, date);
+CREATE TABLE IF NOT EXISTS portfolios (
+    portfolio_id TEXT PRIMARY KEY, name TEXT, universe TEXT, strategy TEXT, hedge TEXT, params TEXT,
+    started TEXT, status TEXT);
 CREATE TABLE IF NOT EXISTS orders (
-    order_id TEXT PRIMARY KEY, decision_id TEXT, symbol TEXT, side TEXT, target_weight {REAL},
+    order_id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', decision_id TEXT, symbol TEXT, side TEXT, target_weight {REAL},
     created_date TEXT, status TEXT, fill_date TEXT, fill_price {REAL}, amount {REAL});
 CREATE TABLE IF NOT EXISTS positions (
-    symbol TEXT PRIMARY KEY, sector TEXT, opened_date TEXT, entry_price {REAL}, value {REAL},
-    cost {REAL}, decision_id TEXT, last_close {REAL});
+    portfolio_id TEXT NOT NULL DEFAULT 'core', symbol TEXT NOT NULL, sector TEXT, opened_date TEXT,
+    entry_price {REAL}, value {REAL}, cost {REAL}, decision_id TEXT, last_close {REAL},
+    PRIMARY KEY (portfolio_id, symbol));
 CREATE TABLE IF NOT EXISTS closed_positions (
-    id TEXT PRIMARY KEY, symbol TEXT, sector TEXT, opened_date TEXT, closed_date TEXT,
+    id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', symbol TEXT, sector TEXT, opened_date TEXT, closed_date TEXT,
     entry_price {REAL}, exit_price {REAL}, ret {REAL}, excess_ret {REAL}, sector_excess_ret {REAL},
     decision_id TEXT, exit_decision_id TEXT, tags TEXT);
 CREATE TABLE IF NOT EXISTS nav (
-    date TEXT PRIMARY KEY, nav {REAL}, cash {REAL}, invested {REAL}, ret {REAL},
-    spy_ret {REAL}, rf_ret {REAL}, turnover {REAL});
+    portfolio_id TEXT NOT NULL DEFAULT 'core', date TEXT NOT NULL, nav {REAL}, cash {REAL}, invested {REAL},
+    ret {REAL}, spy_ret {REAL}, rf_ret {REAL}, turnover {REAL},
+    PRIMARY KEY (portfolio_id, date));
 CREATE TABLE IF NOT EXISTS ic (
     date TEXT NOT NULL, horizon INTEGER NOT NULL, lens TEXT NOT NULL, ic {REAL}, n INTEGER,
     PRIMARY KEY (date, horizon, lens));
 CREATE TABLE IF NOT EXISTS postmortems (
-    id TEXT PRIMARY KEY, month TEXT, case_type TEXT, symbol TEXT, sector TEXT, decision_id TEXT,
+    id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', month TEXT, case_type TEXT, symbol TEXT, sector TEXT, decision_id TEXT,
     cause TEXT, lens TEXT, adjustment TEXT, explanation TEXT, lesson TEXT, excess_ret {REAL}, record TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS case_studies (
-    id TEXT PRIMARY KEY, checkpoint TEXT, symbol TEXT, sector TEXT, decision_id TEXT, decided TEXT,
+    id TEXT PRIMARY KEY, portfolio_id TEXT NOT NULL DEFAULT 'core', checkpoint TEXT, symbol TEXT, sector TEXT, decision_id TEXT, decided TEXT,
     checkpoint_date TEXT, verdict TEXT, title TEXT, excess_spy {REAL}, excess_sector {REAL}, grounded INTEGER,
     record TEXT, created_at TEXT);
 CREATE TABLE IF NOT EXISTS lessons (
@@ -98,6 +104,12 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY, value TEXT);
 """
+
+
+def _table_ddl(table: str) -> str:
+    m = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \(.*?\);", _SCHEMA, re.DOTALL)
+    assert m, table
+    return m.group(0)[:-1]
 
 
 class DB:
@@ -118,11 +130,36 @@ class DB:
                 if stmt.strip():
                     conn.execute(text(stmt))
         # columns added after the first deploy
-        for table, col, typ in [("prices", "volume", types["REAL"])]:
+        added = [
+            ("prices", "volume", types["REAL"]),
+            ("symbols", "asset_class", "TEXT"),
+            ("symbols", "industry", "TEXT"),
+            ("symbols", "benchmark", "TEXT"),
+            *[(t, "portfolio_id", "TEXT NOT NULL DEFAULT 'core'") for t in ("orders", "closed_positions", "postmortems", "case_studies")],
+        ]
+        for table, col, typ in added:
             have = {c["name"] for c in inspect(self.engine).get_columns(table)}
             if col not in have:
                 with self.engine.begin() as conn:
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {typ}"))
+        # v3: one book per portfolio. Tables keyed by symbol or date alone are rebuilt with portfolio_id in the
+        # primary key; every existing row belongs to `core`. Each rebuild is one transaction.
+        for table in ("positions", "nav"):
+            have = [c["name"] for c in inspect(self.engine).get_columns(table)]
+            if "portfolio_id" in have:
+                continue
+            ddl = _table_ddl(table).format(**types).replace(f"EXISTS {table} (", f"EXISTS {table}__v3 (")
+            cols = ", ".join(have)
+            with self.engine.begin() as conn:
+                conn.execute(text(ddl))
+                conn.execute(text(f"INSERT INTO {table}__v3 (portfolio_id, {cols}) SELECT 'core', {cols} FROM {table}"))
+                conn.execute(text(f"DROP TABLE {table}"))
+                conn.execute(text(f"ALTER TABLE {table}__v3 RENAME TO {table}"))
+                cash = conn.execute(text("SELECT value FROM kv WHERE key = 'cash'")).scalar()
+                if cash is not None and table == "positions":
+                    conn.execute(
+                        text("INSERT INTO kv (key, value) VALUES ('cash:core', :v) ON CONFLICT (key) DO NOTHING"), {"v": cash}
+                    )
 
     def execute(self, sql: str, params: dict[str, Any] | None = None) -> None:
         with self.engine.begin() as conn:

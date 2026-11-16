@@ -11,7 +11,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from . import evaluation
-from .config import EVALUATION, FRAMEWORK_VERSION, PORTFOLIO, SECTOR_ETFS
+from .config import CORE, EVALUATION, FRAMEWORK_VERSION, PORTFOLIO, SECTOR_ETFS
 from .db import DB
 from .portfolio import metrics
 
@@ -115,7 +115,7 @@ root.querySelector('#hit').addEventListener('pointermove',show);root.querySelect
 
 
 def _nav_series(db: DB) -> dict[str, list]:
-    rows = db.query("SELECT date, nav, spy_ret, rf_ret FROM nav ORDER BY date")
+    rows = db.query("SELECT date, nav, spy_ret, rf_ret FROM nav WHERE portfolio_id = :p ORDER BY date", {"p": CORE})
     out: dict[str, list] = {"dates": [], "portfolio": [], "spy": [], "cash": []}
     spy = cash = 100.0
     for i, r in enumerate(rows):
@@ -164,6 +164,10 @@ LENS_LABEL = {
 }
 
 
+def _industry(row: dict[str, Any]) -> str:
+    return f"<div class='sub'>{_e(row['industry'])}</div>" if row.get("industry") else ""
+
+
 def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Intraday watchlist rows, with each name's latest framework numbers and review (from the last close)."""
     syms = [r["symbol"] for r in rows]
@@ -171,7 +175,7 @@ def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return []
     names = {f"s{i}": s for i, s in enumerate(syms)}
     clause = "(" + ", ".join(f":{k}" for k in names) + ")"
-    info = {r["symbol"]: r for r in db.query(f"SELECT symbol, name, sector FROM symbols WHERE symbol IN {clause}", names)}
+    info = {r["symbol"]: r for r in db.query(f"SELECT symbol, name, sector, industry FROM symbols WHERE symbol IN {clause}", names)}
     feats = {
         r["symbol"]: r
         for r in db.query(
@@ -184,7 +188,7 @@ def _live_watch(db: DB, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     blank = dict.fromkeys(framework + ("llm_action", "llm_conf"))
     out = []
     for r in rows:
-        row = {**r, "name": None, "sector": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})}
+        row = {**r, "name": None, "sector": None, "industry": None, **info.get(r["symbol"], {}), **blank, **feats.get(r["symbol"], {})}
         row.update({k: r[k] for k in framework if r.get(k) is not None})  # computed in the refresh, at the last close
         out.append(row)
     return out
@@ -240,18 +244,21 @@ def _study_page(row: dict[str, Any]) -> str:
 def build_site(db: DB, out_dir: str) -> None:
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    m = metrics(db)
+    m = metrics(db, CORE)
     ic = evaluation.ic_summary(db)
     cons = evaluation.consistency_rate(db)
     ground = evaluation.grounding_failure_rate(db)
     nav_data = _nav_series(db)
     last_date = db.scalar("SELECT MAX(date) FROM watchlist")
-    pos = db.query("SELECT * FROM positions ORDER BY value DESC")
+    pos = db.query(
+        "SELECT p.*, s.industry FROM positions p LEFT JOIN symbols s ON s.symbol = p.symbol WHERE p.portfolio_id = :p ORDER BY p.value DESC",
+        {"p": CORE},
+    )
     nav = m.get("nav") or PORTFOLIO["starting_nav"]
     decisions = db.query("SELECT record FROM decisions WHERE action IN ('ACCUMULATE', 'EXIT') ORDER BY date DESC, decision_id LIMIT 40")
     review_counts = db.query("SELECT action, COUNT(*) AS n FROM decisions GROUP BY action")
     watch = db.query(
-        "SELECT w.*, s.name, s.sector, f.graham_passed, f.graham_mos, f.buffett_passed, f.marks_pendulum, f.llm_action, f.llm_conf, f.price "
+        "SELECT w.*, s.name, s.sector, s.industry, f.graham_passed, f.graham_mos, f.buffett_passed, f.marks_pendulum, f.llm_action, f.llm_conf, f.price "
         "FROM watchlist w LEFT JOIN symbols s ON s.symbol = w.symbol LEFT JOIN features f ON f.symbol = w.symbol AND f.date = w.date "
         "WHERE w.date = :d ORDER BY w.rank IS NULL, w.rank",
         {"d": last_date},
@@ -270,7 +277,7 @@ def build_site(db: DB, out_dir: str) -> None:
         watch_note = f"As of the {last_date or '–'} close. During market hours it refreshes every 15 minutes."
     # intraday refreshes run every 15 minutes; the run log keeps the daily and monthly runs readable
     runs = db.query("SELECT * FROM runs WHERE kind <> 'intraday' ORDER BY started DESC LIMIT 10")
-    studies = db.query("SELECT * FROM case_studies WHERE grounded = 1 ORDER BY checkpoint_date DESC, id")
+    studies = db.query("SELECT * FROM case_studies WHERE grounded = 1 AND portfolio_id = :p ORDER BY checkpoint_date DESC, id", {"p": CORE})
     (out / "studies").mkdir(exist_ok=True)
     for st in studies:
         (out / "studies" / f"{_study_slug(st['id'])}.html").write_text(_study_page(st))
@@ -284,7 +291,7 @@ def build_site(db: DB, out_dir: str) -> None:
         "<tr><td colspan='6' class='sub'>The first case studies appear once buys reach their three-month checkpoint "
         "having beaten both SPY and their sector ETF by 5 points.</td></tr>"
     )
-    closed = db.query("SELECT * FROM closed_positions ORDER BY closed_date DESC LIMIT 20")
+    closed = db.query("SELECT * FROM closed_positions WHERE portfolio_id = :p ORDER BY closed_date DESC LIMIT 20", {"p": CORE})
     spend = db.query("SELECT SUBSTR(ts, 1, 7) AS month, SUM(usd) AS usd FROM llm_spend GROUP BY SUBSTR(ts, 1, 7) ORDER BY month DESC LIMIT 6")
     reports = db.query("SELECT key, value FROM kv WHERE key LIKE 'report:%' ORDER BY key DESC LIMIT 3")
     lessons = db.query("SELECT * FROM lessons WHERE status = 'active' ORDER BY created_month DESC")
@@ -302,7 +309,7 @@ def build_site(db: DB, out_dir: str) -> None:
     tiles_html = "".join(f'<div class="tile"><div class="k">{_e(k)}</div><div class="v">{_e(v)}</div><div class="n">{_e(n)}</div></div>' for k, v, n in tiles)
 
     pos_rows = "".join(
-        f"<tr><td>{_e(p['symbol'])}</td><td>{_e(p['sector'])}</td><td>{_e(p['opened_date'])}</td>"
+        f"<tr><td>{_e(p['symbol'])}</td><td>{_e(p['sector'])}{_industry(p)}</td><td>{_e(p['opened_date'])}</td>"
         f"<td class='r'>{_num(p['entry_price'])}</td><td class='r'>{_num(p['last_close'])}</td>"
         f"<td class='r'>{_pct(p['value'] / nav, -1)}</td><td class='r'>{_pct(p['value'] / p['cost'] - 1)}</td></tr>"
         for p in pos
@@ -344,7 +351,7 @@ def build_site(db: DB, out_dir: str) -> None:
         return "–" if d == 0 else (f"▲{d}" if d > 0 else f"▼{-d}")
 
     watch_rows = "".join(
-        f"<tr><td class='r'>{_e(w['rank'] or 'held')}</td><td class='r'>{_move(w)}</td><td><b>{_e(w['symbol'])}</b><div class='sub'>{_e(w['name'] or '')}</div></td><td>{_e(w['sector'])}</td>"
+        f"<tr><td class='r'>{_e(w['rank'] or 'held')}</td><td class='r'>{_move(w)}</td><td><b>{_e(w['symbol'])}</b><div class='sub'>{_e(w['name'] or '')}</div></td><td>{_e(w['sector'])}{_industry(w)}</td>"
         f"<td class='r'>{_pct(w['weight'], -1)}</td><td class='r'>{_e(w['items'])}</td><td class='r'>{_num(w['avg_sentiment'], 1)}</td>"
         f"<td class='r'>{_num(w['sentiment_shift'], 1)}</td>"
         f"<td class='r'>{(str(w['graham_passed']) + '/8') if w['graham_passed'] is not None else '–'}</td>"

@@ -2,24 +2,43 @@
 
 from __future__ import annotations
 
+import json
 import math
 from typing import Any
 
 from . import stats
-from .config import EVALUATION, PORTFOLIO
+from .config import CORE, EVALUATION, PORTFOLIO, PORTFOLIOS
 from .db import DB
 
 
-def cash(db: DB) -> float:
-    return float(db.get_kv("cash", PORTFOLIO["starting_nav"]))
+def sync_portfolios(db: DB) -> None:
+    """Write the configured portfolios to the database, so every book has a row describing it."""
+    rows = [
+        {
+            "portfolio_id": pid,
+            "name": p["name"],
+            "universe": p["universe"],
+            "strategy": p["strategy"],
+            "hedge": p.get("hedge"),
+            "params": json.dumps(p.get("params") or {}),
+            "started": p["started"],
+            "status": "active",
+        }
+        for pid, p in PORTFOLIOS.items()
+    ]
+    db.upsert("portfolios", rows, ["portfolio_id"])
 
 
-def positions(db: DB) -> dict[str, dict[str, Any]]:
-    return {p["symbol"]: p for p in db.query("SELECT * FROM positions")}
+def cash(db: DB, pid: str = CORE) -> float:
+    return float(db.get_kv(f"cash:{pid}", PORTFOLIO["starting_nav"]))
 
 
-def last_nav(db: DB) -> float:
-    v = db.scalar("SELECT nav FROM nav ORDER BY date DESC LIMIT 1")
+def positions(db: DB, pid: str = CORE) -> dict[str, dict[str, Any]]:
+    return {p["symbol"]: p for p in db.query("SELECT * FROM positions WHERE portfolio_id = :p", {"p": pid})}
+
+
+def last_nav(db: DB, pid: str = CORE) -> float:
+    v = db.scalar("SELECT nav FROM nav WHERE portfolio_id = :p ORDER BY date DESC LIMIT 1", {"p": pid})
     return float(v) if v is not None else PORTFOLIO["starting_nav"]
 
 
@@ -36,18 +55,22 @@ def run_day(
     sector_of: dict[str, str],
     spy_ret: float | None,
     rf_annual_pct: float | None,
+    pid: str = CORE,
 ) -> dict[str, Any]:
-    """Fill pending orders at today's open, mark everything to today's close, append a NAV row."""
-    if db.scalar("SELECT 1 FROM nav WHERE date = :d", {"d": date}):
+    """Fill one portfolio's pending orders at today's open, mark its book to today's close, append a NAV row."""
+    if db.scalar("SELECT 1 FROM nav WHERE portfolio_id = :p AND date = :d", {"p": pid, "d": date}):
         return {"skipped": "already processed"}
-    nav_prev = last_nav(db)
-    c = cash(db)
-    pos = positions(db)
+    nav_prev = last_nav(db, pid)
+    c = cash(db, pid)
+    pos = positions(db, pid)
     traded = 0.0
     filled_today: set[str] = set()
     events = []
 
-    for o in db.query("SELECT * FROM orders WHERE status = 'pending' AND created_date < :d ORDER BY created_date", {"d": date}):
+    for o in db.query(
+        "SELECT * FROM orders WHERE portfolio_id = :p AND status = 'pending' AND created_date < :d ORDER BY created_date",
+        {"p": pid, "d": date},
+    ):
         sym = o["symbol"]
         bar = bars.get(sym)
         if not bar or not bar.get("open"):
@@ -63,6 +86,7 @@ def run_day(
             c -= amount
             traded += amount
             pos[sym] = {
+                "portfolio_id": pid,
                 "symbol": sym,
                 "sector": sector_of.get(sym),
                 "opened_date": date,
@@ -90,7 +114,8 @@ def run_day(
                 "closed_positions",
                 [
                     {
-                        "id": f"{sym}-{p['opened_date']}-{date}",
+                        "id": f"{sym}-{p['opened_date']}-{date}" if pid == CORE else f"{pid}:{sym}-{p['opened_date']}-{date}",
+                        "portfolio_id": pid,
                         "symbol": sym,
                         "sector": p["sector"],
                         "opened_date": p["opened_date"],
@@ -107,7 +132,7 @@ def run_day(
                 ],
                 ["id"],
             )
-            db.execute("DELETE FROM positions WHERE symbol = :s", {"s": sym})
+            db.execute("DELETE FROM positions WHERE portfolio_id = :p AND symbol = :s", {"p": pid, "s": sym})
             db.execute(
                 "UPDATE orders SET status = 'filled', fill_date = :d, fill_price = :p, amount = :a WHERE order_id = :i",
                 {"d": date, "p": exit_price, "a": proceeds, "i": o["order_id"]},
@@ -124,15 +149,16 @@ def run_day(
     rf_daily = (rf_annual_pct or 0) / 100 / 252
     c *= 1 + rf_daily
 
-    db.execute("DELETE FROM positions")
-    db.upsert("positions", list(pos.values()), ["symbol"])
-    db.set_kv("cash", c)
+    db.execute("DELETE FROM positions WHERE portfolio_id = :p", {"p": pid})
+    db.upsert("positions", [{**p, "portfolio_id": pid} for p in pos.values()], ["portfolio_id", "symbol"])
+    db.set_kv(f"cash:{pid}", c)
     invested = sum(p["value"] for p in pos.values())
     nav = c + invested
     db.upsert(
         "nav",
         [
             {
+                "portfolio_id": pid,
                 "date": date,
                 "nav": nav,
                 "cash": c,
@@ -143,15 +169,15 @@ def run_day(
                 "turnover": traded / nav_prev if nav_prev else 0,
             }
         ],
-        ["date"],
+        ["portfolio_id", "date"],
     )
     return {"nav": nav, "cash": c, "invested": invested, "events": events}
 
 
-def metrics(db: DB) -> dict[str, Any]:
+def metrics(db: DB, pid: str = CORE) -> dict[str, Any]:
     """Absolute return, beta-adjusted alpha vs SPY, drawdown and Sharpe, with intervals that show how
     little a short record proves."""
-    rows = db.query("SELECT * FROM nav ORDER BY date")
+    rows = db.query("SELECT * FROM nav WHERE portfolio_id = :p ORDER BY date", {"p": pid})
     if len(rows) < 2:
         return {"days": len(rows)}
     rets = [r["ret"] for r in rows[1:]]
